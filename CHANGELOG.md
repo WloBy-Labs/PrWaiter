@@ -26,6 +26,17 @@
   正是判断下游是否解除阻塞的依据，不能让它们消失
 - 树里已有但 `imported` 没记的（老数据、手工加的）会在首次刷新时补记，自动完成迁移
 
+### Fixed
+
+- **签名证书不再落在 `dist/`**。`make_signing_cert.sh` 默认输出改到
+  `~/Library/Application Support/PrWaiter/signing/ci/`，与 MacBarWaiter / KeyboardWaiter
+  一致。`dist/` 是构建输出目录、语义上随时可清空，长期密钥搁那儿早晚被误删
+- **密码不再只打印**。原来 `make_signing_cert.sh` 把密码打到 stdout 就完了，
+  终端一关那张 p12 就是打不开的废文件 —— 比丢证书更麻烦，因为你以为自己还有备份。
+  现在会写进 `ci-signing.password`
+- **重跑不再静默覆盖证书**。这张证书的价值全在「固定不变」，误跑第二次就换了身份、
+  装过旧版的用户等于装了个不同的 App。现在默认拒绝覆盖，要换得显式 `FORCE=1`
+
 ## [0.6.1] - 2026-08-07
 
 两个都是持久化相关的修复 —— 在讨论「要不要换 SQLite」时查出来的。
