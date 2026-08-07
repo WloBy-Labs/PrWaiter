@@ -207,6 +207,9 @@ struct Project: Codable, Identifiable {
     var name = "新项目"
     var repo = ""
     var nodes: [Node] = []
+    /// 已经自动导入过的 PR 编号。每个 PR 只导入一次，此后不再重来 ——
+    /// 否则你删掉一个还开着的 PR，下次刷新它又冒出来了。
+    var imported: [Int] = []
 
     init(name: String, repo: String = "", nodes: [Node] = []) {
         self.name = name
@@ -214,7 +217,7 @@ struct Project: Codable, Identifiable {
         self.nodes = nodes
     }
 
-    enum CodingKeys: String, CodingKey { case id, name, repo, nodes }
+    enum CodingKeys: String, CodingKey { case id, name, repo, nodes, imported }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -222,6 +225,28 @@ struct Project: Codable, Identifiable {
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? "新项目"
         repo = try c.decodeIfPresent(String.self, forKey: .repo) ?? ""
         nodes = try c.decodeIfPresent([Node].self, forKey: .nodes) ?? []
+        imported = try c.decodeIfPresent([Int].self, forKey: .imported) ?? []
+    }
+
+    /// 把 GitHub 上查到的 open PR 里没见过的那些放进根级顶部。
+    /// 纯函数，返回 nil 表示没有变化。
+    ///
+    /// 「没见过」= 既不在 imported 里、也不在树里。后半个条件让手工加过的 PR
+    /// 也算数，同时把它们补记进 imported，实现自动迁移。
+    static func importing(_ found: [Int], nodes: [Node], imported: [Int])
+        -> (nodes: [Node], imported: [Int])?
+    {
+        let known = Set(imported).union(nodes.allPRNumbers)
+        let fresh = found.filter { !known.contains($0) }.sorted()
+        let merged = known.union(fresh).sorted()
+        // 没有新 PR，但树里有 imported 没记的（手工加的），也要补记一次
+        if fresh.isEmpty {
+            return merged == imported.sorted() ? nil : (nodes, merged)
+        }
+        var out = nodes
+        // 升序逐个插到最前，结果是编号大的在最上面
+        for n in fresh { out.insert(Node(kind: .pr, pr: n), at: 0) }
+        return (out, merged)
     }
 }
 
@@ -299,9 +324,14 @@ struct Store: Codable {
 enum Prefs {
     static let ghPath = "ghPath"                   // 自定义 gh 路径，空表示自动查找
     static let refreshInterval = "refreshInterval"  // 秒；0 表示只手动刷新
+    static let autoImport = "autoImport"            // 自动把我的 open PR 导进来
 
     static func registerDefaults() {
-        UserDefaults.standard.register(defaults: [refreshInterval: 60])
+        UserDefaults.standard.register(defaults: [refreshInterval: 60, autoImport: true])
+    }
+
+    static var autoImportOn: Bool {
+        UserDefaults.standard.bool(forKey: autoImport)
     }
 
     static var customGhPath: String {
@@ -660,25 +690,48 @@ final class Model: ObservableObject {
     // MARK: 拉取
 
     func refresh() async {
-        guard let p = project else { return }
+        guard let p = project, !p.repo.isEmpty else {
+            if let pid = project?.id { liveByProject[pid] = [:]; error = nil }
+            return
+        }
         let pid = p.id
-        let numbers = p.nodes.allPRNumbers
-        guard !p.repo.isEmpty, !numbers.isEmpty else {
-            // 没配仓库或还没加 PR：也记成「拉过了」，免得每次切回来都白试一次
+        if loading { return }
+        loading = true
+        defer { loading = false }
+
+        // 先把 GitHub 上我的 open PR 导进来，再拉状态 —— 顺序反了的话，
+        // 新导入的这一批要等下一轮刷新才有标题和状态
+        if Prefs.autoImportOn {
+            await importMyOpenPRs(into: pid, repo: p.repo)
+        }
+
+        guard let cur = store.projects.first(where: { $0.id == pid }) else { return }
+        let numbers = cur.nodes.allPRNumbers
+        guard !numbers.isEmpty else {
+            // 一个 PR 都没有：也记成「拉过了」，免得每次切回来都白试一次
             liveByProject[pid] = [:]
             error = nil
             return
         }
-        if loading { return }
-        loading = true
-        defer { loading = false }
         do {
-            liveByProject[pid] = try await Self.fetchLive(repo: p.repo, numbers: numbers)
+            liveByProject[pid] = try await Self.fetchLive(repo: cur.repo, numbers: numbers)
             fetchedAt[pid] = Date()
             error = nil
         } catch let e {
             error = e.localizedDescription
         }
+    }
+
+    /// 把当前 gh 账号在该仓库下所有 open 的 PR 导进来（只导没见过的）
+    func importMyOpenPRs(into pid: UUID, repo: String) async {
+        guard let found = try? await Self.fetchMyOpenPRs(repo: repo) else { return }
+        guard let i = store.projects.firstIndex(where: { $0.id == pid }) else { return }
+        guard let r = Project.importing(found,
+                                        nodes: store.projects[i].nodes,
+                                        imported: store.projects[i].imported) else { return }
+        store.projects[i].nodes = r.nodes
+        store.projects[i].imported = r.imported
+        save()
     }
 
     // GUI app 不继承 shell 的 PATH，得自己找。找不到再退一步问一次登录 shell。
@@ -727,6 +780,25 @@ final class Model: ObservableObject {
             st.account = GhParse.account(from: out.stdout + "\n" + out.stderr)
         }
         return st
+    }
+
+    /// 查当前 gh 账号在该仓库下所有 open 的 PR 编号。
+    /// 用 `gh pr list` 而不是自己拼 GraphQL：一条命令的事，少一份要维护的查询。
+    nonisolated static func fetchMyOpenPRs(repo: String) async throws -> [Int] {
+        guard let gh = ghPath() else { throw AppError("找不到 GitHub CLI（gh）") }
+        guard repo.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil else {
+            throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
+        }
+        let out = try await run(gh, [
+            "pr", "list", "-R", repo,
+            "--author", "@me", "--state", "open",
+            "--limit", "200", "--json", "number",
+        ])
+        guard let arr = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [[String: Any]]
+        else {
+            throw AppError(out.stderr.isEmpty ? "gh pr list 调用失败" : out.stderr)
+        }
+        return arr.compactMap { $0["number"] as? Int }
     }
 
     /// 一次 GraphQL 请求拉完整个项目的 PR 状态
@@ -1278,6 +1350,7 @@ struct SettingsView: View {
     @EnvironmentObject var m: Model
     @AppStorage(Prefs.ghPath) private var customPath = ""
     @AppStorage(Prefs.refreshInterval) private var interval = 60
+    @AppStorage(Prefs.autoImport) private var autoImport = true
 
     static let intervals = [(30, "30 秒"), (60, "1 分钟"), (300, "5 分钟"), (0, "只手动刷新")]
 
@@ -1448,12 +1521,15 @@ struct SettingsView: View {
             }
             .pickerStyle(.segmented)
             .onChange(of: interval) { _, _ in m.rescheduleTimer() }
+            Toggle("自动导入我的 open PR", isOn: $autoImport)
         } header: {
             Text("刷新")
         } footer: {
-            Text("每次刷新是一条 GraphQL 请求，把当前项目所有 PR 的状态一起拉回来。")
-                .font(.caption)
-                .foregroundColor(.secondary)
+            Text("每次刷新会先把当前 gh 账号在该仓库下所有 open 的 PR 导进来（落在根级最上面），"
+                 + "再用一条 GraphQL 请求拉回全部状态。\n"
+                 + "每个 PR 只导入一次：删掉之后不会再被导回来，已合并 / 已关闭的也不会被清走。")
+            .font(.caption)
+            .foregroundColor(.secondary)
         }
     }
 

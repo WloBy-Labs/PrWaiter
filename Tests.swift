@@ -19,6 +19,7 @@ struct Tests {
         collapseTests()
         guideTests()
         reorderTests()
+        autoImportTests()
         projectReorderTests()
         statusTests()
         migrationTests()
@@ -307,6 +308,56 @@ struct Tests {
         node.children = [Node(kind: .pr, pr: 1)]
         check(Tree.move(a.id, toRootIndex: 0, in: [node]) == nil, "项目 id 落到块的缝里当没发生")
         check(Tree.move(a.id, under: node.id, in: [node]) == nil, "项目 id 落到块身上当没发生")
+    }
+
+    static func autoImportTests() {
+        print("自动导入 open PR:")
+        let nodes = [Node(kind: .pr, pr: 100), Node(kind: .pr, pr: 101)]
+
+        // 全新的导进来，落在最前面
+        if let r = Project.importing([100, 101, 200, 201], nodes: nodes, imported: [100, 101]) {
+            check(r.nodes.count == 4, "两个新 PR 都进来了")
+            check(r.nodes.map(\.pr) == [201, 200, 100, 101], "新的排在最前，编号大的在最上")
+            check(r.imported == [100, 101, 200, 201], "imported 记上了新导入的")
+        } else {
+            check(false, "有新 PR 时应该返回改动")
+        }
+
+        // 没有新的就不动
+        check(Project.importing([100, 101], nodes: nodes, imported: [100, 101]) == nil,
+              "没有新 PR 时返回 nil，不白写一次盘")
+        check(Project.importing([], nodes: nodes, imported: [100, 101]) == nil,
+              "一个 open PR 都没有时也不动")
+
+        // 删掉的不该被导回来 —— 这是 imported 存在的全部理由
+        check(Project.importing([100, 101], nodes: [Node(kind: .pr, pr: 100)], imported: [100, 101]) == nil,
+              "删掉的 open PR 不会被重新导入")
+
+        // 手工加过的 PR 要补记进 imported，否则删掉后会被导回来
+        if let r = Project.importing([100], nodes: nodes, imported: []) {
+            check(r.nodes.count == 2, "手工加过的不重复导入")
+            check(r.imported == [100, 101], "树里已有的都补记进 imported")
+        } else {
+            check(false, "imported 落后于树时应该补记")
+        }
+
+        // 嵌套在描述块里的 PR 也算「已知」
+        var topic = Node(kind: .topic, title: "T")
+        topic.children = [Node(kind: .pr, pr: 300)]
+        if let r = Project.importing([300, 301], nodes: [topic], imported: []) {
+            check(r.nodes.count == 2, "只加了没见过的那个")
+            check(r.nodes.first?.pr == 301, "新的落在根级最前")
+            check(r.imported == [300, 301], "嵌套的 PR 也记进 imported")
+        } else {
+            check(false, "应该导入 301")
+        }
+
+        // 空项目起步
+        if let r = Project.importing([5, 3, 4], nodes: [], imported: []) {
+            check(r.nodes.map(\.pr) == [5, 4, 3], "空项目导入后按编号倒序排列")
+        } else {
+            check(false, "空项目应该能导入")
+        }
     }
 
     static func statusTests() {
