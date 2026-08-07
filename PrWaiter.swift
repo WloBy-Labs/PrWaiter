@@ -184,6 +184,22 @@ enum Tree {
         }
         return nodes
     }
+
+    /// 把节点挪到根级的第 index 个位置（index 是「插到谁前面」，等于 count 表示放末尾）。
+    /// 嵌套节点拖过来也走这里，等于同时出组 + 定位。
+    static func move(_ dragged: UUID, toRootIndex index: Int, in nodes: [Node]) -> [Node]? {
+        var nodes = nodes
+        guard let node = nodes.find(dragged) else { return nil }
+        let wasRootAt = nodes.firstIndex { $0.id == dragged }
+        nodes.detach(dragged)
+        // 原来就在根级且排在插入点前面的话，摘掉它之后后面的位置都往前挪了一格
+        var target = index
+        if let p = wasRootAt, p < index { target -= 1 }
+        target = max(0, min(target, nodes.count))
+        if wasRootAt == target { return nil }   // 没挪动，别白写一次盘
+        nodes.insert(node, at: target)
+        return nodes
+    }
 }
 
 struct Project: Codable, Identifiable {
@@ -350,14 +366,25 @@ struct LivePR {
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
 }
 
-enum PRStatus {
-    case ready, waiting, blocked, merged, closed, unknown
+/// 每个 PR 落在且只落在一个状态里，所以描述块上的分项计数加起来正好等于 PR 总数。
+/// 顺序即优先级：先「该你动手的」，再「等上游」，再「等别人/等机器」，最后才是可以合了。
+enum PRStatus: CaseIterable {
+    case merged, closed, draft
+    case ciFailed, changesRequested   // 问题在自己这边，即使被依赖挡着也该先修
+    case blocked                      // 上游还没合
+    case ciRunning, needsReview       // 等机器 / 等人
+    case ready
+    case unknown
 
     var label: String {
         switch self {
         case .ready: return "可合并"
-        case .waiting: return "等 review/CI"
+        case .ciFailed: return "CI 失败"
+        case .changesRequested: return "需修改"
+        case .ciRunning: return "CI 运行中"
+        case .needsReview: return "等 review"
         case .blocked: return "等依赖"
+        case .draft: return "草稿"
         case .merged: return "已合并"
         case .closed: return "已关闭"
         case .unknown: return "未知"
@@ -367,13 +394,54 @@ enum PRStatus {
     var color: Color {
         switch self {
         case .ready: return .green
-        case .waiting: return .orange
-        case .blocked: return .gray
+        case .ciFailed, .changesRequested: return .red
+        case .ciRunning: return .orange
+        case .needsReview, .blocked, .draft: return .gray
         case .merged: return .purple
-        case .closed: return .red
+        case .closed: return .pink
         case .unknown: return .gray
         }
     }
+
+    /// 什么情况下会落到这个状态，给设置里的说明表用
+    var detail: String {
+        switch self {
+        case .ready: return "上游全合了、已批准、CI 通过 —— 可以去催了"
+        case .ciFailed: return "CI 红了。球在你脚下，所以排在「等依赖」前面"
+        case .changesRequested: return "reviewer 要求改动。同样是该你动手"
+        case .ciRunning: return "CI 还在跑，等机器"
+        case .needsReview: return "还没人批准，等人"
+        case .blocked: return "树上游还有没合并的 PR，先轮不到它"
+        case .draft: return "Draft PR，还没打算让人看"
+        case .merged: return "已合并"
+        case .closed: return "关掉了，没合"
+        case .unknown: return "拉不到数据，检查编号或仓库设置"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .ready: return "checkmark.circle.fill"
+        case .ciFailed: return "xmark.octagon.fill"
+        case .changesRequested: return "exclamationmark.bubble.fill"
+        case .ciRunning: return "clock.arrow.circlepath"
+        case .needsReview: return "eye"
+        case .blocked: return "hourglass"
+        case .draft: return "pencil.circle"
+        case .merged: return "checkmark.seal.fill"
+        case .closed: return "xmark.circle"
+        case .unknown: return "questionmark.circle"
+        }
+    }
+
+    /// 描述块上分项计数的排列顺序：先给能立刻动的，已完成的排最后
+    static let summaryOrder: [PRStatus] = [
+        .ready, .ciFailed, .changesRequested, .ciRunning,
+        .needsReview, .blocked, .draft, .merged, .closed, .unknown,
+    ]
+
+    /// 已经尘埃落定、不需要再盯的
+    var isSettled: Bool { self == .merged || self == .closed }
 }
 
 struct AppError: LocalizedError {
@@ -518,6 +586,13 @@ final class Model: ObservableObject {
     func move(_ dragged: UUID, under target: UUID?) {
         guard let i = projectIndex,
               let moved = Tree.move(dragged, under: target, in: store.projects[i].nodes) else { return }
+        store.projects[i].nodes = moved
+        save()
+    }
+
+    func move(_ dragged: UUID, toRootIndex index: Int) {
+        guard let i = projectIndex,
+              let moved = Tree.move(dragged, toRootIndex: index, in: store.projects[i].nodes) else { return }
         store.projects[i].nodes = moved
         save()
     }
@@ -710,12 +785,22 @@ final class Model: ObservableObject {
     // MARK: 状态推导
 
     func status(pr: Int, blocked: Bool) -> PRStatus {
-        guard let lv = live[pr] else { return .unknown }
+        Self.classify(live[pr], blocked: blocked)
+    }
+
+    /// 纯函数，方便单独测；分类是互斥的，命中一个就返回
+    nonisolated static func classify(_ lv: LivePR?, blocked: Bool) -> PRStatus {
+        guard let lv else { return .unknown }
         if lv.state == "MERGED" { return .merged }
         if lv.state == "CLOSED" { return .closed }
+        if lv.isDraft { return .draft }
+        // CI 红了、被要求改，都是自己这边的事，被依赖挡着也一样要修
+        if lv.ci == "FAILURE" || lv.ci == "ERROR" { return .ciFailed }
+        if lv.review == "CHANGES_REQUESTED" { return .changesRequested }
         if blocked { return .blocked }
-        if !lv.isDraft, lv.review == "APPROVED", lv.ci == nil || lv.ci == "SUCCESS" { return .ready }
-        return .waiting
+        if lv.ci == "PENDING" || lv.ci == "EXPECTED" { return .ciRunning }
+        if lv.review != "APPROVED" { return .needsReview }
+        return .ready
     }
 }
 
@@ -734,23 +819,32 @@ extension Model {
         allRows.filter { !$0.hidden }
     }
 
-    /// 每个描述块下辖的 PR 数与其中可合并的数量
-    var topicSummary: [UUID: (total: Int, ready: Int)] {
+    /// 每个描述块下辖的 PR 按状态分桶。互斥分类，各项加起来等于总数。
+    var topicSummary: [UUID: [PRStatus: Int]] {
         let all = allRows
-        var out: [UUID: (Int, Int)] = [:]
+        var out: [UUID: [PRStatus: Int]] = [:]
         for (i, row) in all.enumerated() where row.node.kind == .topic {
-            var total = 0, ready = 0
+            var counts: [PRStatus: Int] = [:]
             var j = i + 1
             while j < all.count, all[j].depth > row.depth {
                 if all[j].node.kind == .pr, let p = all[j].node.pr {
-                    total += 1
-                    if status(pr: p, blocked: all[j].blocked) == .ready { ready += 1 }
+                    counts[status(pr: p, blocked: all[j].blocked), default: 0] += 1
                 }
                 j += 1
             }
-            out[row.node.id] = (total, ready)
+            out[row.node.id] = counts
         }
         return out
+    }
+
+    /// 整个项目的状态分桶，给顶部汇总用
+    var projectSummary: [PRStatus: Int] {
+        var counts: [PRStatus: Int] = [:]
+        for r in allRows where r.node.kind == .pr {
+            guard let p = r.node.pr else { continue }
+            counts[status(pr: p, blocked: r.blocked), default: 0] += 1
+        }
+        return counts
     }
 
     func prs(matching wanted: PRStatus) -> [Int] {
@@ -972,10 +1066,18 @@ struct ContentView: View {
                         .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.1)))
                         .padding(.bottom, 8)
                     }
-                    summary.padding(.bottom, 6)
+                    // 状态图例搬到设置里了：那是查一两次就记住的参照材料，
+                    // 不该长期占着主界面一行；即时查询有徽标的悬停提示兜着
                     if m.editing { addBar.padding(.bottom, 6) }
-                    ForEach(m.rows) { row in
+                    // 根级行之间插入投放缝，用来调整根级顺序；子行不需要（层级由父子决定）
+                    ForEach(Array(m.rows.enumerated()), id: \.element.id) { _, row in
+                        if m.editing, row.depth == 0 {
+                            RootGap(index: rootIndex(before: row))
+                        }
                         NodeRow(row: row)
+                    }
+                    if m.editing, !(m.project?.nodes ?? []).isEmpty {
+                        RootGap(index: m.project?.nodes.count ?? 0)   // 末尾那条缝
                     }
                     if (m.project?.nodes ?? []).isEmpty {
                         Text(m.editing
@@ -990,6 +1092,11 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+    }
+
+    /// 这一行在根级数组里的下标（它是根级行时才有意义）
+    func rootIndex(before row: Row) -> Int {
+        m.project?.nodes.firstIndex { $0.id == row.node.id } ?? 0
     }
 
     var emptyProjects: some View {
@@ -1008,35 +1115,6 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
     }
 
-    var summary: some View {
-        let ready = m.readyPRs
-        let merged = m.mergedPRs
-        return HStack(spacing: 14) {
-            if ready.isEmpty {
-                Text("暂无可合并的 PR").foregroundColor(.secondary)
-            } else {
-                Text(verbatim: "🟢 可合并：" + ready.map { "#\($0)" }.joined(separator: " "))
-                    .fontWeight(.semibold)
-                    .foregroundColor(.green)
-            }
-            if !merged.isEmpty {
-                Text(verbatim: "✔ 已合并 \(merged.count)").foregroundColor(.secondary)
-                if m.editing {
-                    Button("清理已合并") {
-                        let ids = m.rows.filter { r in
-                            r.node.kind == .pr && r.node.pr.map { merged.contains($0) } == true
-                        }.map(\.node.id)
-                        m.editAndRefresh { p in
-                            for id in ids { p.nodes.removePromotingChildren(id) }
-                        }
-                    }
-                    .buttonStyle(.link)
-                }
-            }
-            Spacer()
-        }
-        .font(.callout)
-    }
 
     var addBar: some View {
         HStack(spacing: 8) {
@@ -1047,13 +1125,28 @@ struct ContentView: View {
             Button("添加 PR", action: addPR)
             Divider().frame(height: 18)
             Button {
-                m.edit { $0.nodes.append(Node(kind: .topic, title: "新描述块")) }
+                // 新建的放最上面，刚加的东西不该要滚到底才看得到
+                m.edit { $0.nodes.insert(Node(kind: .topic, title: "新描述块"), at: 0) }
             } label: {
                 Label("描述块", systemImage: "plus")
             }
             .help("新增一个描述块，用来写功能 / bug 的说明，PR 拖进去归类")
+            // 汇总行没了，这个按钮挪到编辑态的操作栏
+            let merged = m.mergedPRs
+            if !merged.isEmpty {
+                Divider().frame(height: 18)
+                Button("清理已合并 \(merged.count) 个") {
+                    // 用 allRows：折叠起来的也要一起清
+                    let ids = m.allRows.filter { r in
+                        r.node.kind == .pr && r.node.pr.map { merged.contains($0) } == true
+                    }.map(\.node.id)
+                    m.editAndRefresh { p in
+                        for id in ids { p.nodes.removePromotingChildren(id) }
+                    }
+                }
+            }
             Spacer()
-            Text("拖动块可重新组织层级")
+            Text("拖到块上归类，拖到块之间调顺序")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -1063,7 +1156,8 @@ struct ContentView: View {
         guard let n = Int(newPR.trimmingCharacters(in: .whitespaces)) else { return }
         newPR = ""
         guard !(m.project?.nodes.allPRNumbers.contains(n) ?? false) else { return }
-        m.editAndRefresh { $0.nodes.append(Node(kind: .pr, pr: n)) }   // 新 PR 一律先落在根级
+        // 新 PR 落在根级最上面，之后靠拖拽归类
+        m.editAndRefresh { $0.nodes.insert(Node(kind: .pr, pr: n), at: 0) }
     }
 
     var rootDropZone: some View {
@@ -1104,6 +1198,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             ghSection
+            statusSection
             refreshSection
             aboutSection
         }
@@ -1230,6 +1325,34 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: 状态说明
+
+    /// 描述块右侧的徽标只有图标和数字，这里是那张对照表
+    var statusSection: some View {
+        Section {
+            ForEach(PRStatus.summaryOrder.filter { $0 != .unknown }, id: \.self) { st in
+                HStack(spacing: 10) {
+                    Image(systemName: st.symbol)
+                        .foregroundColor(st.isSettled ? .secondary : st.color)
+                        .frame(width: 18)
+                    Text(st.label)
+                        .frame(width: 82, alignment: .leading)
+                    Text(st.detail)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer(minLength: 0)
+                }
+            }
+        } header: {
+            Text("状态说明")
+        } footer: {
+            Text("每个 PR 只落在一个状态里，所以描述块右侧的分项数加起来正好等于 PR 总数。"
+                 + "列表里把徽标悬停也能看到状态名。")
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+    }
+
     // MARK: 刷新
 
     var refreshSection: some View {
@@ -1273,6 +1396,61 @@ struct SettingsView: View {
         if let u = URL(string: url) { NSWorkspace.shared.open(u) }
     }
 }
+// MARK: - 根级插入缝
+
+/// 根级块之间的一条投放缝：平时几乎看不见，拖拽悬停时显示成插入线。
+/// 有它才能调整根级顺序 —— 落在块身上是「成为子块」，落在缝里才是「排到这个位置」。
+struct RootGap: View {
+    @EnvironmentObject var m: Model
+    let index: Int
+    @State private var targeted = false
+
+    var body: some View {
+        ZStack {
+            Color.clear
+            Capsule()
+                .fill(Color.accentColor)
+                .frame(height: 3)
+                .padding(.horizontal, 2)
+                .opacity(targeted ? 1 : 0)
+        }
+        // 给足高度：这是拖拽落点，太窄不好瞄
+        .frame(height: 14)
+        .contentShape(Rectangle())
+        .dropDestination(for: String.self) { items, _ in
+            guard let id = items.first.flatMap(UUID.init) else { return false }
+            m.move(id, toRootIndex: index)
+            return true
+        } isTargeted: { targeted = $0 }
+    }
+}
+
+// MARK: - 状态分项计数
+
+/// 一排「图标 + 数字」的小徽标，按状态分项。只显示非零项，鼠标悬停有文字说明。
+struct StatusChips: View {
+    let counts: [PRStatus: Int]
+    var compact = false
+
+    var body: some View {
+        HStack(spacing: compact ? 5 : 7) {
+            ForEach(PRStatus.summaryOrder.filter { (counts[$0] ?? 0) > 0 }, id: \.self) { st in
+                let n = counts[st] ?? 0
+                HStack(spacing: 2) {
+                    Image(systemName: st.symbol).font(.system(size: compact ? 9 : 10))
+                    Text(verbatim: "\(n)").font(.caption2.monospacedDigit())
+                }
+                // 已完成的压暗，别和还要盯的抢注意力
+                .foregroundColor(st.isSettled ? .secondary : st.color)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Capsule().fill((st.isSettled ? Color.secondary : st.color).opacity(0.13)))
+                .help("\(st.label) \(n) 个")
+            }
+        }
+    }
+}
+
 // MARK: - 缩进连线
 
 /// 一格缩进宽度里画的线
@@ -1416,7 +1594,8 @@ struct NodeRow: View {
     // MARK: 描述块
 
     var topicBody: some View {
-        let sum = m.topicSummary[row.node.id] ?? (total: 0, ready: 0)
+        let sum = m.topicSummary[row.node.id] ?? [:]
+        let total = sum.values.reduce(0, +)
         return HStack(spacing: 0) {
             collapseZone
             HStack(spacing: 8) {
@@ -1432,14 +1611,15 @@ struct NodeRow: View {
             } else {
                 Text(row.node.title.isEmpty ? "（未命名描述块）" : row.node.title)
                     .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .foregroundColor(row.node.title.isEmpty ? .secondary : .primary)
             }
-            Spacer()
+            Spacer(minLength: 8)
             collapsedBadge
-            if sum.total > 0 {
-                Text(verbatim: "\(sum.total) 个 PR" + (sum.ready > 0 ? " · \(sum.ready) 个可合并" : ""))
-                    .font(.caption)
-                    .foregroundColor(sum.ready > 0 ? .green : .secondary)
+            if total > 0 {
+                Text(verbatim: "\(total) 个 PR").font(.caption).foregroundColor(.secondary)
+                StatusChips(counts: sum)
             }
             if m.editing { deleteButton }
             }
@@ -1527,10 +1707,10 @@ struct NodeRow: View {
         .help("删除本块，子块会提升一层")
     }
 
+    // 状态标签已经涵盖草稿，这里只补充「review 和 CI 各自什么情况」这个维度
     @ViewBuilder
     func badges(_ lv: LivePR?) -> some View {
         if let lv {
-            if lv.isDraft { tag("草稿", .gray) }
             switch lv.review ?? "" {
             case "APPROVED": tag("已批准", .green)
             case "CHANGES_REQUESTED": tag("需修改", .red)
