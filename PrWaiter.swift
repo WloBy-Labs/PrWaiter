@@ -403,6 +403,22 @@ enum PRStatus: CaseIterable {
         }
     }
 
+    /// 什么情况下会落到这个状态，给设置里的说明表用
+    var detail: String {
+        switch self {
+        case .ready: return "上游全合了、已批准、CI 通过 —— 可以去催了"
+        case .ciFailed: return "CI 红了。球在你脚下，所以排在「等依赖」前面"
+        case .changesRequested: return "reviewer 要求改动。同样是该你动手"
+        case .ciRunning: return "CI 还在跑，等机器"
+        case .needsReview: return "还没人批准，等人"
+        case .blocked: return "树上游还有没合并的 PR，先轮不到它"
+        case .draft: return "Draft PR，还没打算让人看"
+        case .merged: return "已合并"
+        case .closed: return "关掉了，没合"
+        case .unknown: return "拉不到数据，检查编号或仓库设置"
+        }
+    }
+
     var symbol: String {
         switch self {
         case .ready: return "checkmark.circle.fill"
@@ -1050,7 +1066,8 @@ struct ContentView: View {
                         .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.1)))
                         .padding(.bottom, 8)
                     }
-                    legend.padding(.bottom, 8)
+                    // 状态图例搬到设置里了：那是查一两次就记住的参照材料，
+                    // 不该长期占着主界面一行；即时查询有徽标的悬停提示兜着
                     if m.editing { addBar.padding(.bottom, 6) }
                     // 根级行之间插入投放缝，用来调整根级顺序；子行不需要（层级由父子决定）
                     ForEach(Array(m.rows.enumerated()), id: \.element.id) { _, row in
@@ -1098,24 +1115,6 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
     }
 
-    /// 图例：描述块右侧那排徽标只有图标和数字，这里说明每个图标是什么意思。
-    /// 固定列出全部状态（不随数据增减），当参照表用才有意义。
-    var legend: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 11) {
-                ForEach(PRStatus.summaryOrder.filter { $0 != .unknown }, id: \.self) { st in
-                    HStack(spacing: 3) {
-                        Image(systemName: st.symbol)
-                            .font(.system(size: 9))
-                            .foregroundColor(st.isSettled ? .secondary : st.color)
-                        Text(st.label).foregroundColor(.secondary)
-                    }
-                }
-            }
-            .font(.caption2)
-            .padding(.vertical, 1)
-        }
-    }
 
     var addBar: some View {
         HStack(spacing: 8) {
@@ -1199,6 +1198,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             ghSection
+            statusSection
             refreshSection
             aboutSection
         }
@@ -1322,6 +1322,34 @@ struct SettingsView: View {
             .onChange(of: m.installLog.count) { _, n in
                 proxy.scrollTo(n - 1, anchor: .bottom)
             }
+        }
+    }
+
+    // MARK: 状态说明
+
+    /// 描述块右侧的徽标只有图标和数字，这里是那张对照表
+    var statusSection: some View {
+        Section {
+            ForEach(PRStatus.summaryOrder.filter { $0 != .unknown }, id: \.self) { st in
+                HStack(spacing: 10) {
+                    Image(systemName: st.symbol)
+                        .foregroundColor(st.isSettled ? .secondary : st.color)
+                        .frame(width: 18)
+                    Text(st.label)
+                        .frame(width: 82, alignment: .leading)
+                    Text(st.detail)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer(minLength: 0)
+                }
+            }
+        } header: {
+            Text("状态说明")
+        } footer: {
+            Text("每个 PR 只落在一个状态里，所以描述块右侧的分项数加起来正好等于 PR 总数。"
+                 + "列表里把徽标悬停也能看到状态名。")
+            .font(.caption)
+            .foregroundColor(.secondary)
         }
     }
 
