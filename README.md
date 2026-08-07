@@ -136,6 +136,7 @@ brew install gh && gh auth login
 | --- | --- |
 | `PrWaiter.swift` | 整个 App：数据模型、树操作、GitHub 拉取、SwiftUI 界面 |
 | `Tests.swift` | 纯逻辑测试：树操作、拖拽合法性、数据迁移、JSON 往返 |
+| `make-icon.swift` | 用代码画 App 图标，构建时生成 `.icns`，不往仓库塞二进制 |
 | `build.sh` | 一条 `swiftc` 命令产出 `PrWaiter.app` |
 | `test.sh` | 跑测试（`-DTESTING` 关掉 `@main`，改由 `Tests.swift` 提供入口） |
 | `release.sh` | 打 tag、构建、上传 GitHub Release |
@@ -143,6 +144,19 @@ brew install gh && gh auth login
 
 改完代码 `./test.sh && ./build.sh && open PrWaiter.app` 即可验证。
 界面交互（尤其拖拽）测试覆盖不到，需要手动过一遍。
+
+### 图标
+
+图标是程序化绘制的，不是图片资产：`make-icon.swift` 输出一整套 iconset，
+`build.sh` 再用 `iconutil` 打成 `.icns` 塞进 app bundle。想单独预览：
+
+```bash
+swift make-icon.swift /tmp/preview.iconset
+```
+
+`.icns` 允许每个尺寸用不同画面，所以这里做了尺寸降级：128px 以上带 WLOBY PR 字标，
+64px 及以下只留树形图，16px 再简化成两层。这不是偷懒 —— 七个字符在 32px 下
+每个只有约 4px 宽，画上去只是一团噪点。
 
 > 编辑器可能对 `@main` 报 `'main' attribute cannot be used in a module that contains
 > top-level code` —— 这是 SourceKit 未带 `-parse-as-library` 参数导致的误报，`build.sh`
