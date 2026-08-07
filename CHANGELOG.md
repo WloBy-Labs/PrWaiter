@@ -5,10 +5,34 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-> **0.x 属于设计调试阶段**：只在此维护变更记录，不打 tag、不出包。
-> 等设计稳定后再提升到 1.0.0，届时才开始发布 Release 包。
+> 0.6.0 起开始发布 Release 包：打 `v*` tag 触发 CI 构建签名的 DMG。
+> 此前的 0.1.0–0.5.1 属于设计调试阶段，只有变更记录，没有发布产物。
 
 ## [Unreleased]
+
+## [0.6.0] - 2026-08-07
+
+第一个可下载的版本。
+
+### Added
+
+- **发布流水线**：打 `v*` tag 触发 GitHub Actions 构建 `.app`、签名、打成带
+  Applications 拖拽目标的 DMG 并创建 Release
+- **渐进式签名**：没配 secret 走 ad-hoc；配了 `MACOS_CERT_P12` 用固定自签身份；
+  再配上 Apple 凭据则额外公证。三档都能出包，只是 Gatekeeper 的表现不同
+- `scripts/make_signing_cert.sh` 生成固定的自签证书（不需要 Apple 开发者账号），
+  打印出要贴进 GitHub Secrets 的值
+- `scripts/bootstrap_local_signing.sh` 在本地建立稳定签名身份，自己构建时用
+- `scripts/package_app.sh` / `scripts/make_dmg.sh` 本地也能出一样的产物
+- `release_notes/v<版本>.md`：发布说明单独维护，CI 优先用它，没有才自动生成
+
+### Changed
+
+- `release.sh` 从「自己构建上传」改成「校验 + 打 tag 推送」，构建交给 CI。
+  校验包括：工作区干净、在 main 上、与 origin/main 一致、CHANGELOG 有对应小节、测试通过
+- `build.sh` 支持 `APP_DIR` / `APP_VERSION` / `BUILD_NUMBER` 环境变量，
+  好让打包脚本复用它，不必把 swiftc 那行抄第二遍
+- 去掉 `release.sh` 里「0.x 拒绝发布」的闸门
 
 ## [0.5.1] - 2026-08-07
 

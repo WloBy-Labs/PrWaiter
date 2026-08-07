@@ -1,6 +1,7 @@
 # 构建产物
 PrWaiter.app/
 PrWaiter.iconset/
+/dist
 *.icns
 *.zip
 
