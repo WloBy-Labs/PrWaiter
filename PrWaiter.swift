@@ -785,7 +785,9 @@ struct ContentView: View {
     }
 
     var body: some View {
-        Group {
+        VStack(alignment: .leading, spacing: 0) {
+            controlRow
+            Divider()
             switch page {
             case .board:
                 boardPage
@@ -795,15 +797,12 @@ struct ContentView: View {
         }
         .frame(minWidth: 720, minHeight: 480)
         .animation(.easeInOut(duration: 0.15), value: page)
-        // 应用名和版本号交给窗口自己的标题条，不再另做一条重复的
+        // 窗口标题条只留应用名和版本，不挂任何按钮 —— 保持干净
         .navigationTitle(Text(verbatim: "PrWaiter v\(Self.appVersion)"))
-        .toolbar { toolbar }
     }
 
     var boardPage: some View {
         VStack(alignment: .leading, spacing: 0) {
-            projectTabs
-            Divider()
             if m.editing, m.project != nil {
                 projectSettings
                 Divider()
@@ -812,21 +811,33 @@ struct ContentView: View {
         }
     }
 
-    // MARK: 工具栏（直接长在窗口标题条上）
+    // MARK: 控制条（项目切换与操作按钮同处一行，标题条不放东西）
 
-    @ToolbarContentBuilder
-    var toolbar: some ToolbarContent {
-        if page == .settings {
-            // 设置页只留一个返回，右边什么都不放
-            ToolbarItem(placement: .navigation) {
+    var controlRow: some View {
+        HStack(spacing: 10) {
+            if page == .settings {
+                // 返回摆在内容区左侧，不去挤红黄绿那一条
                 Button { page = .board } label: {
                     Image(systemName: "chevron.left")
                 }
+                .buttonStyle(.bordered)
                 .help("返回看板")
                 .keyboardShortcut(.cancelAction)
+                Text("设置").font(.headline)
+                Spacer()
+            } else {
+                projectTabs
+                boardActions
             }
-        } else {
-            ToolbarItemGroup(placement: .primaryAction) {
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    var boardActions: some View {
+        HStack(spacing: 10) {
+            // 时间戳与刷新按钮分开摆，别挤成一坨
+            Group {
                 if m.loading {
                     ProgressView().controlSize(.small)
                 } else if let t = m.updatedAt {
@@ -834,23 +845,34 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                Button { Task { await m.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                    .disabled(m.loading)
-                    .help("立即刷新")
-                Button(m.editing ? "完成" : "编辑") {
-                    m.editing.toggle()
-                    m.save()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(m.editing ? .green : .accentColor)
-                .help(m.editing ? "退出编辑，冻结布局" : "进入编辑，可拖动、增删")
-                Button { page = .settings } label: {
-                    Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
-                        .foregroundColor(m.gh.ready ? .primary : .orange)
-                }
-                .help(m.gh.ready ? "设置" : "gh 还没配好，点这里")
             }
+            .frame(minWidth: 76, alignment: .trailing)   // 宽度固定，刷新时按钮不会左右跳
+
+            Button { Task { await m.refresh() } } label: {
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: 16, height: 16)
+            }
+            .buttonStyle(.bordered)
+            .disabled(m.loading)
+            .help("立即刷新")
+
+            Button(m.editing ? "完成" : "编辑") {
+                m.editing.toggle()
+                m.save()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(m.editing ? .green : .accentColor)
+            .help(m.editing ? "退出编辑，冻结布局" : "进入编辑，可拖动、增删")
+
+            Button { page = .settings } label: {
+                Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
+                    .frame(width: 16, height: 16)
+                    .foregroundColor(m.gh.ready ? .primary : .orange)
+            }
+            .buttonStyle(.bordered)
+            .help(m.gh.ready ? "设置" : "gh 还没配好，点这里")
         }
+        .fixedSize()   // 按钮区不被标签挤压
     }
 
     // MARK: 项目标签
@@ -888,9 +910,9 @@ struct ContentView: View {
                     .help("新增项目")
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            .padding(.vertical, 2)   // 内外边距交给控制条统一控制
         }
+        .frame(maxWidth: .infinity, alignment: .leading)   // 标签占满剩余宽度，按钮靠右
     }
 
     // MARK: 项目设置（编辑态）
