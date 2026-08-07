@@ -455,10 +455,11 @@ struct AppError: LocalizedError {
 @MainActor
 final class Model: ObservableObject {
     @Published var store = Store()
-    @Published var live: [Int: LivePR] = [:]   // 只缓存当前项目的 PR
+    // 按项目分开缓存：切标签时上一次拉到的数据还在，能立刻显示，不用等网络
+    @Published private var liveByProject: [UUID: [Int: LivePR]] = [:]
+    @Published private var fetchedAt: [UUID: Date] = [:]
     @Published var error: String?
     @Published var loading = false
-    @Published var updatedAt: Date?
     @Published var editing = false
     @Published var gh = GhStatus()
     @Published var detecting = false
@@ -466,6 +467,16 @@ final class Model: ObservableObject {
     @Published var installing = false
 
     private var timer: Timer?
+
+    /// 当前项目的实时状态
+    var live: [Int: LivePR] {
+        store.selected.flatMap { liveByProject[$0] } ?? [:]
+    }
+
+    /// 当前项目上次拉取的时间。按项目分开，否则切过去会显示别的项目的时间，是骗人的
+    var updatedAt: Date? {
+        store.selected.flatMap { fetchedAt[$0] }
+    }
 
     static let dataURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -554,10 +565,13 @@ final class Model: ObservableObject {
     func select(_ id: UUID) {
         guard store.selected != id else { return }
         store.selected = id
-        live = [:]
         error = nil
         save()
-        Task { await self.refresh() }
+        // 切标签不重新拉取：上次的数据立刻显示，要最新的自己点刷新，
+        // 定时器下一拍也会带上。只有从没拉过的项目才拉一次，不然会是一片空白。
+        if liveByProject[id] == nil {
+            Task { await self.refresh() }
+        }
     }
 
     // MARK: 落盘
@@ -597,16 +611,28 @@ final class Model: ObservableObject {
         save()
     }
 
+    func deleteCurrentProject() {
+        guard let i = projectIndex else { return }
+        let gone = store.projects.remove(at: i).id
+        liveByProject[gone] = nil     // 缓存跟着项目走，别留孤儿
+        fetchedAt[gone] = nil
+        store.selected = store.projects.first?.id
+        error = nil
+        save()
+        if let now = store.selected, liveByProject[now] == nil {
+            Task { await self.refresh() }
+        }
+    }
+
     // MARK: 拉取
 
     func refresh() async {
-        guard let p = project else {
-            live = [:]
-            return
-        }
+        guard let p = project else { return }
+        let pid = p.id
         let numbers = p.nodes.allPRNumbers
         guard !p.repo.isEmpty, !numbers.isEmpty else {
-            live = [:]
+            // 没配仓库或还没加 PR：也记成「拉过了」，免得每次切回来都白试一次
+            liveByProject[pid] = [:]
             error = nil
             return
         }
@@ -614,9 +640,9 @@ final class Model: ObservableObject {
         loading = true
         defer { loading = false }
         do {
-            live = try await Self.fetchLive(repo: p.repo, numbers: numbers)
+            liveByProject[pid] = try await Self.fetchLive(repo: p.repo, numbers: numbers)
+            fetchedAt[pid] = Date()
             error = nil
-            updatedAt = Date()
         } catch let e {
             error = e.localizedDescription
         }
@@ -1026,12 +1052,7 @@ struct ContentView: View {
             .onSubmit { Task { await m.refresh() } }
             Spacer()
             Button("删除本项目", role: .destructive) {
-                guard let i = m.projectIndex else { return }
-                m.store.projects.remove(at: i)
-                m.store.selected = m.store.projects.first?.id
-                m.live = [:]
-                m.save()
-                Task { await m.refresh() }
+                m.deleteCurrentProject()
             }
         }
         .textFieldStyle(.roundedBorder)
