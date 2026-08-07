@@ -18,18 +18,18 @@ PR 的标题、review 结论、CI 结论、是否已合并，GitHub 全都知道
 其余状态每次刷新都通过 `gh` 的**单次 GraphQL 批量查询**实时拉取，不存副本 —— 状态永远不会过期，
 也没有任何同步逻辑需要维护。
 
-## 安装
+## 下载与安装
 
-构建依赖：macOS 14+ 与 Command Line Tools（提供 `swiftc`，**不需要** Xcode 工程）。
+[Releases](https://github.com/WloBy-Labs/PrWaiter/releases) 里有拖拽安装的 DMG。
+打开后把 PrWaiter 拖进 Applications 即可。
 
-```bash
-./build.sh
-open PrWaiter.app
-```
+> Release 包用固定的自签身份签名（`PrWaiter Signing`），但证书没经过 Apple 公证，
+> 所以**首次打开 Gatekeeper 会警告**：在「系统设置 → 隐私与安全性」里点一次
+> 「仍要打开」，或者右键点 App 选「打开」。去掉这个警告需要付费的 Developer ID 加公证。
 
-运行依赖是 [GitHub CLI](https://cli.github.com/)，但**不用先自己装**：
-首次打开如果没检测到 gh，齿轮按钮会变橙色，进设置页可以一键用 Homebrew 装，
-装完再点「在终端登录」完成授权。想手动来也行：
+运行还需要 [GitHub CLI](https://cli.github.com/)，PR 的实时状态靠它拉取。
+**不用先自己装**：首次打开如果没检测到 gh，齿轮按钮会变橙色，进设置页可以一键用
+Homebrew 装，装完再点「在终端登录」完成授权。想手动来也行：
 
 ```bash
 brew install gh && gh auth login
@@ -38,9 +38,25 @@ brew install gh && gh auth login
 没有 gh 时 App 不会崩，树结构、描述块、拖拽、折叠都照常可用，
 只是拉不到 PR 的标题和 review / CI 状态 —— 因为本地只存结构，状态是实时拉的。
 
-想常驻的话，把 `PrWaiter.app` 拖进 `/Applications` 即可。
+### 自己构建
 
-> 当前处于 0.x 设计调试阶段，尚不提供预构建的 Release 包，请自行 `./build.sh`。
+依赖只有 macOS 14+ 与 Command Line Tools（提供 `swiftc`，**不需要** Xcode 工程）。
+
+```bash
+./build.sh && open PrWaiter.app     # 开发时这样就够
+```
+
+要出和 Release 一样的产物：
+
+```bash
+scripts/bootstrap_local_signing.sh   # 一次性：建立稳定的本地签名身份（可选）
+scripts/package_app.sh               # 产出 dist/PrWaiter.app
+scripts/make_dmg.sh                  # 产出 dist/PrWaiter-<版本>.dmg
+```
+
+不跑 `bootstrap_local_signing.sh` 的话走 ad-hoc 签名，一样能用，只是每次构建的
+签名都不同。PrWaiter 不申请任何系统权限（屏幕录制之类），所以稳定签名在这里
+**不涉及「保住权限」**，只是让 App 在系统眼里始终是同一个身份。
 
 ## 使用
 
@@ -159,7 +175,11 @@ brew install gh && gh auth login
 | `make-icon.swift` | 用代码画 App 图标，构建时生成 `.icns`，不往仓库塞二进制 |
 | `build.sh` | 一条 `swiftc` 命令产出 `PrWaiter.app` |
 | `test.sh` | 跑测试（`-DTESTING` 关掉 `@main`，改由 `Tests.swift` 提供入口） |
-| `release.sh` | 打 tag、构建、上传 GitHub Release |
+| `release.sh` | 校验 + 打 tag，构建交给 CI |
+| `scripts/package_app.sh` | 构建并签名 `dist/PrWaiter.app` |
+| `scripts/make_dmg.sh` | 打成带 Applications 拖拽目标的 DMG |
+| `scripts/bootstrap_local_signing.sh` | 一次性建立本地稳定签名身份 |
+| `scripts/make_signing_cert.sh` | 生成给 CI 用的固定自签证书 |
 | `VERSION` | 版本号的唯一来源，构建时注入 Info.plist |
 
 改完代码 `./test.sh && ./build.sh && open PrWaiter.app` 即可验证。
@@ -202,18 +222,35 @@ swift make-icon.swift /tmp/preview.iconset
 
 ## 版本与发版
 
-版本号唯一来源是 `VERSION` 文件，构建时注入 Info.plist，App 界面上会显示。
+版本号唯一来源是 `VERSION` 文件，构建时注入 Info.plist，设置页里能看到。
 
-当前 **0.x 属于设计调试阶段**：只维护 `CHANGELOG.md`，不打 tag、不出包
-（`release.sh` 在 0.x 下会主动拒绝执行）。
-
-等设计稳定、升到 1.0.0 之后，发版流程是：
+发版流程：
 
 1. 更新 `VERSION`
 2. 在 `CHANGELOG.md` 顶部新增对应版本小节，把 `[Unreleased]` 里累积的条目挪过去
-3. 提交并推送
-4. 执行 `./release.sh` —— 它会校验工作区干净、从 CHANGELOG 抽取 release notes、
-   构建并打包 `.app`、打 tag 并创建 GitHub Release
+3. 写 `release_notes/v<版本>.md`（没有的话 CI 会自动生成，但不如手写）
+4. 提交并推送到 main
+5. 执行 `./release.sh` —— 它只做校验和打 tag：工作区干净、在 main 上、
+   与 origin/main 一致、CHANGELOG 有对应小节、测试通过，然后推 tag
+
+推上 tag 之后 GitHub Actions 负责构建、签名、打 DMG 并创建 Release。
+
+### 签名
+
+发布签名分三档，配到哪档就到哪档，都能出包：
+
+| 配置 | 效果 |
+| --- | --- |
+| 什么都不配 | ad-hoc 签名。能装能跑，但每次构建签名都不同 |
+| `MACOS_CERT_P12` + `MACOS_CERT_PASSWORD` | 用固定的自签身份，身份跨版本一致 |
+| 再加 `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_PASSWORD` | 额外公证并装订，Gatekeeper 不再警告 |
+
+第二档的证书用 `scripts/make_signing_cert.sh` 生成，它会打印出要贴进
+Settings → Secrets and variables → Actions 的两个值。**生成的 `signing-cert.p12`
+和密码要留好**，每次发版复用同一张，身份才是稳定的。
+
+第三档需要付费的 Apple 开发者账号，这是去掉 Gatekeeper 警告的唯一途径 ——
+自签证书做不到，别指望。
 
 ## License
 
