@@ -877,6 +877,7 @@ struct NodeRow: View {
     @State private var targeted = false
     @State private var draft = ""
     @State private var confirmDelete = false
+    @State private var hovering = false
 
     var body: some View {
         // 连线格和卡片并排，格子撑满整行高度（含上下留白），竖线才能连起来不断
@@ -906,25 +907,38 @@ struct NodeRow: View {
         if row.node.kind == .topic { topicBody } else { prBody }
     }
 
-    /// 折叠三角。冻结模式下也能用 —— 折叠只是换个看法，不算改内容。
-    @ViewBuilder
-    var chevron: some View {
-        if row.node.children.isEmpty {
-            Color.clear.frame(width: 14)
-        } else {
-            Button {
-                m.toggleCollapse(row.node.id)
-            } label: {
-                Image(systemName: row.node.collapsed ? "chevron.right" : "chevron.down")
-                    .font(.caption.weight(.semibold))
-                    .foregroundColor(.secondary)
-                    .frame(width: 14)
-                    .contentShape(Rectangle())
+    /// 卡片最左边隔出的一条全高折叠区。
+    /// 做成一整条而不是一个小三角，是因为小图标太难点；没有子块时留空，保持各行左边缘对齐。
+    var collapseZone: some View {
+        let hasKids = !row.node.children.isEmpty
+        return Button {
+            m.toggleCollapse(row.node.id)
+        } label: {
+            ZStack {
+                if hasKids {
+                    // 常驻一层淡底，让这一条看上去就是个可点的槽，不用等 hover 才发现
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.secondary.opacity(hovering ? 0.18 : 0.06))
+                        .padding(.vertical, 4)
+                        .padding(.leading, 8)    // 让开卡片左边缘的状态色条
+                        .padding(.trailing, 2)
+                    Image(systemName: row.node.collapsed ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(hovering ? .primary : .secondary)
+                        .padding(.leading, 6)
+                }
             }
-            .buttonStyle(.plain)
-            .help(row.node.collapsed ? "展开" : "折叠")
+            .frame(width: Self.zoneWidth)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .disabled(!hasKids)
+        .onHover { hovering = $0 }
+        .help(row.node.collapsed ? "展开（\(row.descendants) 个块）" : "折叠")
     }
+
+    static let zoneWidth: CGFloat = 32
 
     /// 折叠时提示里面藏了多少块
     @ViewBuilder
@@ -944,9 +958,10 @@ struct NodeRow: View {
 
     var topicBody: some View {
         let sum = m.topicSummary[row.node.id] ?? (total: 0, ready: 0)
-        return HStack(spacing: 8) {
+        return HStack(spacing: 0) {
+            collapseZone
+            HStack(spacing: 8) {
             if m.editing { grip }
-            chevron
             Image(systemName: "text.bubble").foregroundColor(.accentColor)
             if m.editing {
                 TextField("写点什么，比如「修复 spill 内存统计」", text: Binding(
@@ -968,8 +983,9 @@ struct NodeRow: View {
                     .foregroundColor(sum.ready > 0 ? .green : .secondary)
             }
             if m.editing { deleteButton }
+            }
+            .padding(EdgeInsets(top: 10, leading: 6, bottom: 10, trailing: 10))
         }
-        .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 10))
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor.opacity(0.25)))
     }
@@ -980,10 +996,11 @@ struct NodeRow: View {
         let num = row.node.pr ?? 0
         let lv = m.live[num]
         let st = m.status(pr: num, blocked: row.blocked)
-        return VStack(alignment: .leading, spacing: 5) {
+        return HStack(spacing: 0) {
+            collapseZone
+            VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 8) {
                 if m.editing { grip }
-                chevron
                 // 一律 verbatim：PR 编号是标识符，不能被本地化成 "#77,255"
                 if let lv, let u = URL(string: lv.url), !m.editing {
                     Link(destination: u) { Text(verbatim: "#\(num)") }
@@ -1015,8 +1032,9 @@ struct NodeRow: View {
                 }
             }
             .font(.caption)
+            }
+            .padding(EdgeInsets(top: 8, leading: 6, bottom: 8, trailing: 10))
         }
-        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 10))
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.2)))
         .overlay(alignment: .leading) {
