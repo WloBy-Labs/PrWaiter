@@ -20,6 +20,7 @@ struct Tests {
         guideTests()
         migrationTests()
         codableTests()
+        ghParseTests()
 
         print(failed == 0 ? "\n全部通过" : "\n\(failed) 项失败")
         exit(failed == 0 ? 0 : 1)
@@ -290,6 +291,46 @@ struct Tests {
         } else {
             check(false, "手写 JSON 应该能读")
         }
+    }
+
+    static func ghParseTests() {
+        print("gh 输出解析:")
+
+        check(GhParse.version(from: "gh version 2.96.0 (2026-06-11)\nhttps://...") == "2.96.0",
+              "解析出 gh 版本号")
+        check(GhParse.version(from: "") == nil, "空输出没有版本号")
+        check(GhParse.version(from: "command not found") == nil, "无关输出不误判成版本号")
+
+        // 登录态：gh auth status 的实际输出格式
+        let loggedIn = """
+        github.com
+          ✓ Logged in to github.com account Joob1n (keyring)
+          - Active account: true
+          - Token scopes: 'gist', 'read:org', 'repo'
+        """
+        check(GhParse.account(from: loggedIn) == "Joob1n", "解析出登录账号")
+
+        check(GhParse.account(from: "You are not logged into any GitHub hosts.") == nil,
+              "未登录时返回 nil")
+        check(GhParse.account(from: "") == nil, "空输出返回 nil")
+
+        // 路径优先级
+        let c1 = GhParse.candidates(custom: "", pathEnv: "/usr/bin:/bin", home: "/Users/x")
+        check(c1.first == "/opt/homebrew/bin/gh", "没自定义时 Homebrew 排最前")
+        check(c1.contains("/opt/local/bin/gh"), "包含 MacPorts 路径")
+        check(c1.contains("/Users/x/.local/bin/gh"), "包含用户级安装路径")
+        check(c1.contains("/usr/bin/gh"), "PATH 里的目录也纳入候选")
+        check(Set(c1).count == c1.count, "候选路径不重复")
+
+        let c2 = GhParse.candidates(custom: "/my/gh", pathEnv: "", home: "/Users/x")
+        check(c2.first == "/my/gh", "自定义路径优先级最高")
+
+        let c3 = GhParse.candidates(custom: "  /my/gh  ", pathEnv: "", home: "/Users/x")
+        check(c3.first == "/my/gh", "自定义路径两端空白被去掉")
+
+        let c4 = GhParse.candidates(custom: "/opt/homebrew/bin/gh", pathEnv: "", home: "/Users/x")
+        check(c4.filter { $0 == "/opt/homebrew/bin/gh" }.count == 1,
+              "自定义路径与内置路径相同时不重复")
     }
 }
 

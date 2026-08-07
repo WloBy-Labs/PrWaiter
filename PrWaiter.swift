@@ -264,6 +264,80 @@ struct Store: Codable {
     }
 }
 
+// MARK: - 配置项
+
+enum Prefs {
+    static let ghPath = "ghPath"                   // 自定义 gh 路径，空表示自动查找
+    static let refreshInterval = "refreshInterval"  // 秒；0 表示只手动刷新
+
+    static func registerDefaults() {
+        UserDefaults.standard.register(defaults: [refreshInterval: 60])
+    }
+
+    static var customGhPath: String {
+        UserDefaults.standard.string(forKey: ghPath) ?? ""
+    }
+
+    static var interval: Int {
+        UserDefaults.standard.integer(forKey: refreshInterval)
+    }
+}
+
+// MARK: - 工具链探测
+
+/// gh 的安装与登录情况
+struct GhStatus {
+    var path: String?
+    var version: String?
+    var account: String?      // nil 表示没登录
+    var brewPath: String?
+
+    var installed: Bool { path != nil }
+    var ready: Bool { path != nil && account != nil }
+}
+
+/// 从命令输出里抠信息，纯字符串处理，可单独测试
+enum GhParse {
+    /// "gh version 2.96.0 (2026-06-11)" → "2.96.0"
+    static func version(from out: String) -> String? {
+        guard let line = out.split(separator: "\n").first(where: { $0.contains("gh version") }) else {
+            return nil
+        }
+        let parts = line.split(separator: " ")
+        guard let i = parts.firstIndex(of: "version"), i + 1 < parts.count else { return nil }
+        return String(parts[i + 1])
+    }
+
+    /// "✓ Logged in to github.com account Joob1n (keyring)" → "Joob1n"
+    /// 没登录时 gh 会输出 "You are not logged into any GitHub hosts"，返回 nil
+    static func account(from out: String) -> String? {
+        for line in out.split(separator: "\n") where line.contains("Logged in to") {
+            let parts = line.split(separator: " ")
+            guard let i = parts.firstIndex(of: "account"), i + 1 < parts.count else { continue }
+            let name = parts[i + 1].trimmingCharacters(in: CharacterSet(charactersIn: "()"))
+            if !name.isEmpty { return name }
+        }
+        return nil
+    }
+
+    /// 按优先级排出候选路径：自定义 > 常见安装位置 > PATH 里的每一段
+    static func candidates(custom: String, pathEnv: String, home: String) -> [String] {
+        var out: [String] = []
+        let trimmed = custom.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty { out.append(trimmed) }
+        out += [
+            "/opt/homebrew/bin/gh",     // Apple Silicon Homebrew
+            "/usr/local/bin/gh",        // Intel Homebrew
+            "/opt/local/bin/gh",        // MacPorts
+            "/usr/bin/gh",
+            "\(home)/.local/bin/gh",
+        ]
+        out += pathEnv.split(separator: ":").map { "\($0)/gh" }
+        var seen = Set<String>()
+        return out.filter { seen.insert($0).inserted }
+    }
+}
+
 // MARK: - GitHub 实时状态
 
 struct LivePR {
@@ -318,6 +392,12 @@ final class Model: ObservableObject {
     @Published var loading = false
     @Published var updatedAt: Date?
     @Published var editing = false
+    @Published var gh = GhStatus()
+    @Published var detecting = false
+    @Published var installLog: [String] = []
+    @Published var installing = false
+
+    private var timer: Timer?
 
     static let dataURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -327,6 +407,7 @@ final class Model: ObservableObject {
     }()
 
     init() {
+        Prefs.registerDefaults()
         if let data = try? Data(contentsOf: Self.dataURL) {
             if let s = try? JSONDecoder().decode(Store.self, from: data), !s.projects.isEmpty {
                 store = s
@@ -337,9 +418,58 @@ final class Model: ObservableObject {
         }
         if store.selected == nil { store.selected = store.projects.first?.id }
         Task { await self.refresh() }
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        Task { await self.detectToolchain() }
+        rescheduleTimer()
+    }
+
+    /// 刷新间隔改了要重排，间隔为 0 表示只手动刷新
+    func rescheduleTimer() {
+        timer?.invalidate()
+        timer = nil
+        let seconds = Prefs.interval
+        guard seconds > 0 else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: Double(seconds), repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
+    }
+
+    func detectToolchain() async {
+        detecting = true
+        gh = await Self.detectGh()
+        detecting = false
+    }
+
+    /// 用 Homebrew 装 gh。输出流式显示 —— brew 可能要跑几分钟，不能让人干等一个转圈。
+    func installGh() async {
+        guard let brew = gh.brewPath, !installing else { return }
+        installing = true
+        installLog = ["$ brew install gh"]
+        let code = await Self.runStreaming(brew, ["install", "gh"]) { [weak self] line in
+            Task { @MainActor in
+                self?.installLog.append(line)
+                if self?.installLog.count ?? 0 > 400 { self?.installLog.removeFirst(100) }
+            }
+        }
+        installLog.append(code == 0 ? "── 安装完成" : "── 失败，退出码 \(code)")
+        installing = false
+        await detectToolchain()
+        await refresh()
+    }
+
+    /// gh auth login 是交互式的（要选协议、要按回车开浏览器），塞不进后台进程，
+    /// 所以开一个终端窗口把命令跑起来，让用户在那边完成。
+    func openLoginInTerminal() {
+        guard let gh = gh.path else { return }
+        let script = """
+        tell application "Terminal"
+            activate
+            do script "\(gh) auth login"
+        end tell
+        """
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script]
+        try? proc.run()
     }
 
     // MARK: 当前项目
@@ -417,16 +547,58 @@ final class Model: ObservableObject {
         }
     }
 
-    // GUI app 不继承 shell PATH，按常见安装位置找 gh
+    // GUI app 不继承 shell 的 PATH，得自己找。找不到再退一步问一次登录 shell。
     nonisolated static func ghPath() -> String? {
-        ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+        let fm = FileManager.default
+        let candidates = GhParse.candidates(
+            custom: Prefs.customGhPath,
+            pathEnv: ProcessInfo.processInfo.environment["PATH"] ?? "",
+            home: NSHomeDirectory()
+        )
+        if let hit = candidates.first(where: { fm.isExecutableFile(atPath: $0) }) { return hit }
+        return ghPathFromLoginShell()
+    }
+
+    /// 装在非常规位置时的兜底：用登录 shell 跑一次 `command -v gh`，能读到用户 profile 里的 PATH
+    nonisolated static func ghPathFromLoginShell() -> String? {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        guard FileManager.default.isExecutableFile(atPath: shell) else { return nil }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: shell)
+        proc.arguments = ["-lc", "command -v gh"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        let path = (String(data: data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
+    }
+
+    nonisolated static func brewPath() -> String? {
+        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// 探测 gh 装没装、登没登
+    nonisolated static func detectGh() async -> GhStatus {
+        var st = GhStatus(brewPath: brewPath())
+        guard let gh = ghPath() else { return st }
+        st.path = gh
+        st.version = GhParse.version(from: (try? await run(gh, ["--version"]))?.stdout ?? "")
+        // gh auth status 未登录时以非 0 退出并写 stderr，两股都要看
+        if let out = try? await run(gh, ["auth", "status"]) {
+            st.account = GhParse.account(from: out.stdout + "\n" + out.stderr)
+        }
+        return st
     }
 
     /// 一次 GraphQL 请求拉完整个项目的 PR 状态
     nonisolated static func fetchLive(repo: String, numbers: Set<Int>) async throws -> [Int: LivePR] {
         guard let gh = ghPath() else {
-            throw AppError("找不到 gh，请先 brew install gh 并 gh auth login")
+            throw AppError("找不到 GitHub CLI（gh），到设置里可以一键安装")
         }
         guard repo.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil else {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
@@ -467,6 +639,47 @@ final class Model: ObservableObject {
             throw AppError(msg)
         }
         return live
+    }
+
+    /// 边跑边把输出一行行吐出来，装 gh 时用（brew 可能要跑好几分钟，不能干等）
+    nonisolated static func runStreaming(
+        _ path: String, _ args: [String],
+        onLine: @escaping @Sendable (String) -> Void
+    ) async -> Int32 {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: path)
+                proc.arguments = args
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = pipe
+                do {
+                    try proc.run()
+                } catch {
+                    onLine("启动失败：\(error.localizedDescription)")
+                    cont.resume(returning: -1)
+                    return
+                }
+                let handle = pipe.fileHandleForReading
+                var buffer = Data()
+                while true {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty { break }
+                    buffer.append(chunk)
+                    while let idx = buffer.firstIndex(of: 0x0A) {
+                        let line = Data(buffer[buffer.startIndex..<idx])
+                        onLine(String(data: line, encoding: .utf8) ?? "")
+                        buffer = Data(buffer[(idx + 1)...])
+                    }
+                }
+                if !buffer.isEmpty {
+                    onLine(String(data: buffer, encoding: .utf8) ?? "")
+                }
+                proc.waitUntilExit()
+                cont.resume(returning: proc.terminationStatus)
+            }
+        }
     }
 
     nonisolated static func run(_ path: String, _ args: [String]) async throws -> (stdout: String, stderr: String) {
@@ -562,6 +775,7 @@ struct ContentView: View {
     @EnvironmentObject var m: Model
     @State private var newPR = ""
     @State private var rootTargeted = false
+    @State private var showSettings = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -576,6 +790,9 @@ struct ContentView: View {
             content
         }
         .frame(minWidth: 720, minHeight: 480)
+        .sheet(isPresented: $showSettings) {
+            SettingsView().environmentObject(m)
+        }
     }
 
     // MARK: 标题栏
@@ -596,6 +813,11 @@ struct ContentView: View {
             Button { Task { await m.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                 .disabled(m.loading)
                 .help("立即刷新")
+            Button { showSettings = true } label: {
+                Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
+                    .foregroundColor(m.gh.ready ? .primary : .orange)
+            }
+            .help(m.gh.ready ? "设置" : "gh 还没配好，点这里")
             Button(m.editing ? "完成" : "编辑") {
                 m.editing.toggle()
                 m.save()
@@ -689,12 +911,21 @@ struct ContentView: View {
                 // spacing 为 0：每行自带上下留白，连线才能连续不断
                 VStack(alignment: .leading, spacing: 0) {
                     if let e = m.error {
-                        Label(e, systemImage: "exclamationmark.triangle")
-                            .foregroundColor(.red)
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.1)))
-                            .padding(.bottom, 8)
+                        HStack {
+                            Label(e, systemImage: "exclamationmark.triangle")
+                            Spacer()
+                            // gh 没配好是最常见的失败原因，直接给个去处
+                            if !m.gh.ready {
+                                Button("去设置") { showSettings = true }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                            }
+                        }
+                        .foregroundColor(.red)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.1)))
+                        .padding(.bottom, 8)
                     }
                     summary.padding(.bottom, 6)
                     if m.editing { addBar.padding(.bottom, 6) }
@@ -811,6 +1042,196 @@ struct ContentView: View {
             m.move(id, under: nil)
             return true
         } isTargeted: { rootTargeted = $0 }
+    }
+}
+
+// MARK: - 设置
+
+struct SettingsView: View {
+    @EnvironmentObject var m: Model
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(Prefs.ghPath) private var customPath = ""
+    @AppStorage(Prefs.refreshInterval) private var interval = 60
+
+    static let intervals = [(30, "30 秒"), (60, "1 分钟"), (300, "5 分钟"), (0, "只手动刷新")]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("设置").font(.title3.weight(.semibold))
+                Spacer()
+                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(14)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    ghSection
+                    refreshSection
+                    aboutSection
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(width: 520, height: 520)
+    }
+
+    // MARK: GitHub CLI
+
+    var ghSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("GitHub CLI", "PR 的实时状态靠 gh 拉取，它不装、不登录就只能看到本地记的结构")
+
+            HStack(spacing: 8) {
+                if m.detecting {
+                    ProgressView().controlSize(.small)
+                    Text("检测中…").foregroundColor(.secondary)
+                } else if m.gh.ready {
+                    Label("已就绪", systemImage: "checkmark.circle.fill").foregroundColor(.green)
+                    Text(verbatim: "gh \(m.gh.version ?? "?") · 已登录 \(m.gh.account ?? "")")
+                        .foregroundColor(.secondary)
+                } else if m.gh.installed {
+                    Label("已安装，但没登录", systemImage: "person.crop.circle.badge.exclamationmark")
+                        .foregroundColor(.orange)
+                    Text(verbatim: "gh \(m.gh.version ?? "?")").foregroundColor(.secondary)
+                } else {
+                    Label("没找到 gh", systemImage: "xmark.circle.fill").foregroundColor(.red)
+                }
+                Spacer()
+                Button("重新检测") { Task { await m.detectToolchain() } }
+                    .disabled(m.detecting)
+            }
+            .font(.callout)
+
+            if let p = m.gh.path {
+                Text(verbatim: p)
+                    .font(.caption.monospaced())
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            actionRow
+            if !m.installLog.isEmpty { installOutput }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("自定义 gh 路径").font(.caption).foregroundColor(.secondary)
+                HStack {
+                    TextField("留空则自动查找", text: $customPath)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+                        .onSubmit { Task { await m.detectToolchain() } }
+                    Button("应用") { Task { await m.detectToolchain() } }
+                }
+                Text("装在非常规位置时填这里。自动查找会依次试 Homebrew、MacPorts、PATH，最后问一次登录 shell。")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.top, 4)
+        }
+    }
+
+    @ViewBuilder
+    var actionRow: some View {
+        HStack(spacing: 8) {
+            if !m.gh.installed {
+                if m.gh.brewPath != nil {
+                    Button {
+                        Task { await m.installGh() }
+                    } label: {
+                        Label(m.installing ? "安装中…" : "用 Homebrew 安装 gh", systemImage: "arrow.down.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(m.installing)
+                    if m.installing { ProgressView().controlSize(.small) }
+                } else {
+                    // 连 brew 都没有，只能给路子，不能替他装
+                    Text("没检测到 Homebrew").foregroundColor(.secondary).font(.callout)
+                    Button("安装 Homebrew") { open("https://brew.sh") }
+                    Button("下载 gh 安装包") { open("https://github.com/cli/cli/releases/latest") }
+                }
+            } else if m.gh.account == nil {
+                Button {
+                    m.openLoginInTerminal()
+                } label: {
+                    Label("在终端登录", systemImage: "terminal")
+                }
+                .buttonStyle(.borderedProminent)
+                Text("登录要选协议、按回车开浏览器，只能在终端里完成")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                Button("重新登录") { m.openLoginInTerminal() }
+            }
+        }
+    }
+
+    var installOutput: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(Array(m.installLog.enumerated()), id: \.offset) { i, line in
+                        Text(verbatim: line)
+                            .font(.caption2.monospaced())
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .id(i)
+                    }
+                }
+                .padding(6)
+            }
+            .frame(height: 120)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+            .onChange(of: m.installLog.count) { _, n in
+                proxy.scrollTo(n - 1, anchor: .bottom)
+            }
+        }
+    }
+
+    // MARK: 刷新
+
+    var refreshSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("刷新", "每次刷新是一条 GraphQL 请求，把当前项目所有 PR 的状态一起拉回来")
+            Picker("自动刷新间隔", selection: $interval) {
+                ForEach(Self.intervals, id: \.0) { Text($0.1).tag($0.0) }
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: interval) { _, _ in m.rescheduleTimer() }
+        }
+    }
+
+    // MARK: 关于
+
+    var aboutSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("关于", nil)
+            Text(verbatim: "PrWaiter \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
+                .font(.callout)
+            HStack {
+                Text(verbatim: Model.dataURL.path)
+                    .font(.caption.monospaced())
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Button("在 Finder 中显示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([Model.dataURL])
+                }
+                .buttonStyle(.link)
+            }
+        }
+    }
+
+    func sectionTitle(_ t: String, _ sub: String?) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(t).font(.headline)
+            if let sub {
+                Text(sub).font(.caption).foregroundColor(.secondary)
+            }
+        }
+    }
+
+    func open(_ url: String) {
+        if let u = URL(string: url) { NSWorkspace.shared.open(u) }
     }
 }
 
