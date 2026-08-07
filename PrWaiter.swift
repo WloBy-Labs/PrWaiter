@@ -1050,7 +1050,7 @@ struct ContentView: View {
                         .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.1)))
                         .padding(.bottom, 8)
                     }
-                    summary.padding(.bottom, 6)
+                    legend.padding(.bottom, 8)
                     if m.editing { addBar.padding(.bottom, 6) }
                     // 根级行之间插入投放缝，用来调整根级顺序；子行不需要（层级由父子决定）
                     ForEach(Array(m.rows.enumerated()), id: \.element.id) { _, row in
@@ -1098,41 +1098,23 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
     }
 
-    var summary: some View {
-        let ready = m.readyPRs
-        let merged = m.mergedPRs
-        let counts = m.projectSummary
-        let total = counts.values.reduce(0, +)
-        // 版面和描述块那一行对齐：左边一句话，右边「N 个 PR + 状态徽标」，
-        // 这样整列统计从上到下是一条直线，视线不用来回找
-        return HStack(spacing: 14) {
-            if ready.isEmpty {
-                Text("暂无可合并的 PR").foregroundColor(.secondary)
-            } else {
-                Text(verbatim: "🟢 可合并：" + ready.map { "#\($0)" }.joined(separator: " "))
-                    .fontWeight(.semibold)
-                    .foregroundColor(.green)
-            }
-            Spacer(minLength: 8)
-            if m.editing, !merged.isEmpty {
-                Button("清理已合并 \(merged.count) 个") {
-                    // 用 allRows：折叠起来的也要一起清
-                    let ids = m.allRows.filter { r in
-                        r.node.kind == .pr && r.node.pr.map { merged.contains($0) } == true
-                    }.map(\.node.id)
-                    m.editAndRefresh { p in
-                        for id in ids { p.nodes.removePromotingChildren(id) }
+    /// 图例：描述块右侧那排徽标只有图标和数字，这里说明每个图标是什么意思。
+    /// 固定列出全部状态（不随数据增减），当参照表用才有意义。
+    var legend: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 11) {
+                ForEach(PRStatus.summaryOrder.filter { $0 != .unknown }, id: \.self) { st in
+                    HStack(spacing: 3) {
+                        Image(systemName: st.symbol)
+                            .font(.system(size: 9))
+                            .foregroundColor(st.isSettled ? .secondary : st.color)
+                        Text(st.label).foregroundColor(.secondary)
                     }
                 }
-                .buttonStyle(.link)
             }
-            if total > 0 {
-                Text(verbatim: "\(total) 个 PR").font(.caption).foregroundColor(.secondary)
-                StatusChips(counts: counts)
-            }
+            .font(.caption2)
+            .padding(.vertical, 1)
         }
-        .font(.callout)
-        .padding(.trailing, 10)   // 和卡片内的右留白对齐，徽标才真的排成一列
     }
 
     var addBar: some View {
@@ -1150,6 +1132,20 @@ struct ContentView: View {
                 Label("描述块", systemImage: "plus")
             }
             .help("新增一个描述块，用来写功能 / bug 的说明，PR 拖进去归类")
+            // 汇总行没了，这个按钮挪到编辑态的操作栏
+            let merged = m.mergedPRs
+            if !merged.isEmpty {
+                Divider().frame(height: 18)
+                Button("清理已合并 \(merged.count) 个") {
+                    // 用 allRows：折叠起来的也要一起清
+                    let ids = m.allRows.filter { r in
+                        r.node.kind == .pr && r.node.pr.map { merged.contains($0) } == true
+                    }.map(\.node.id)
+                    m.editAndRefresh { p in
+                        for id in ids { p.nodes.removePromotingChildren(id) }
+                    }
+                }
+            }
             Spacer()
             Text("拖到块上归类，拖到块之间调顺序")
                 .font(.caption)
