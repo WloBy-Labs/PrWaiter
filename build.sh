@@ -7,7 +7,13 @@ VERSION=$(cat VERSION)
 APP=PrWaiter.app
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+# 图标由 make-icon.swift 现画，不往仓库里塞二进制资产
+rm -rf PrWaiter.iconset
+swift make-icon.swift PrWaiter.iconset > /dev/null
+iconutil -c icns PrWaiter.iconset -o "$APP/Contents/Resources/PrWaiter.icns"
+rm -rf PrWaiter.iconset
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -18,6 +24,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleDisplayName</key><string>PrWaiter</string>
     <key>CFBundleIdentifier</key><string>me.xining.prwaiter</string>
     <key>CFBundleExecutable</key><string>PrWaiter</string>
+    <key>CFBundleIconFile</key><string>PrWaiter</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
