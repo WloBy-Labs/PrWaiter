@@ -780,54 +780,63 @@ struct ContentView: View {
     /// 设置不再弹窗，而是主区域里换一页 —— 看板和设置是同一个界面的两个页面
     enum Page { case board, settings }
 
+    static var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            titleBar
-            Divider()
+        Group {
             switch page {
             case .board:
                 boardPage
             case .settings:
-                SettingsView(onBack: { page = .board })
-                    .environmentObject(m)
-                    .transition(.opacity)
+                SettingsView().environmentObject(m)
             }
         }
         .frame(minWidth: 720, minHeight: 480)
         .animation(.easeInOut(duration: 0.15), value: page)
+        // 应用名和版本号交给窗口自己的标题条，不再另做一条重复的
+        .navigationTitle(Text(verbatim: "PrWaiter v\(Self.appVersion)"))
+        .toolbar { toolbar }
     }
 
-    @ViewBuilder
     var boardPage: some View {
-        projectTabs
-        Divider()
-        if m.editing, m.project != nil {
-            projectSettings
+        VStack(alignment: .leading, spacing: 0) {
+            projectTabs
             Divider()
+            if m.editing, m.project != nil {
+                projectSettings
+                Divider()
+            }
+            content
         }
-        content
     }
 
-    // MARK: 标题栏
+    // MARK: 工具栏（直接长在窗口标题条上）
 
-    var titleBar: some View {
-        HStack(spacing: 10) {
-            Text("⏳ PrWaiter").font(.headline)
-            Text("v" + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"))
-                .font(.caption)
-                .foregroundColor(.secondary)
-            Spacer()
-            if m.loading { ProgressView().controlSize(.small) }
-            if let t = m.updatedAt {
-                Text("更新于 " + t.formatted(date: .omitted, time: .standard))
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+    @ToolbarContentBuilder
+    var toolbar: some ToolbarContent {
+        if page == .settings {
+            // 设置页只留一个返回，右边什么都不放
+            ToolbarItem(placement: .navigation) {
+                Button { page = .board } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .help("返回看板")
+                .keyboardShortcut(.cancelAction)
             }
-            Button { Task { await m.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                .disabled(m.loading)
-                .help("立即刷新")
-            // 编辑只对看板有意义
-            if page == .board {
+        } else {
+            ToolbarItemGroup(placement: .primaryAction) {
+                if m.loading {
+                    ProgressView().controlSize(.small)
+                } else if let t = m.updatedAt {
+                    Text("更新于 " + t.formatted(date: .omitted, time: .shortened))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Button { Task { await m.refresh() } } label: { Image(systemName: "arrow.clockwise") }
+                    .disabled(m.loading)
+                    .help("立即刷新")
                 Button(m.editing ? "完成" : "编辑") {
                     m.editing.toggle()
                     m.save()
@@ -835,29 +844,13 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(m.editing ? .green : .accentColor)
                 .help(m.editing ? "退出编辑，冻结布局" : "进入编辑，可拖动、增删")
+                Button { page = .settings } label: {
+                    Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
+                        .foregroundColor(m.gh.ready ? .primary : .orange)
+                }
+                .help(m.gh.ready ? "设置" : "gh 还没配好，点这里")
             }
-            // 齿轮是两页之间的开关，摆在最右端 —— 「编辑」隐藏时它才不会移位，
-            // 否则同一个位置点不了第二下
-            Button {
-                page = page == .settings ? .board : .settings
-            } label: {
-                Image(systemName: gearIcon)
-                    .foregroundColor(gearColor)
-            }
-            .help(page == .settings ? "回到看板" : (m.gh.ready ? "设置" : "gh 还没配好，点这里"))
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-    }
-
-    var gearIcon: String {
-        if page == .settings { return "gearshape.fill" }
-        return m.gh.ready ? "gearshape" : "gearshape.badge.checkmark"
-    }
-
-    var gearColor: Color {
-        if page == .settings { return .accentColor }
-        return m.gh.ready ? .primary : .orange
     }
 
     // MARK: 项目标签
@@ -1077,98 +1070,87 @@ struct ContentView: View {
 
 // MARK: - 设置
 
+/// 用原生 Form + grouped 样式：标签在左、控件在右，随窗口宽度自适应，
+/// 不用自己拍一个 maxWidth 的魔数。这也是 macOS 系统设置的排版方式。
 struct SettingsView: View {
     @EnvironmentObject var m: Model
-    let onBack: () -> Void
     @AppStorage(Prefs.ghPath) private var customPath = ""
     @AppStorage(Prefs.refreshInterval) private var interval = 60
 
     static let intervals = [(30, "30 秒"), (60, "1 分钟"), (300, "5 分钟"), (0, "只手动刷新")]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // 站在项目标签那一行的位置上，两页切换时这一条不会跳
-            HStack(spacing: 8) {
-                Button {
-                    onBack()
-                } label: {
-                    Label("看板", systemImage: "chevron.left")
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(.accentColor)
-                .keyboardShortcut(.cancelAction)
-                Text("设置").font(.headline)
-                Spacer()
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    ghSection
-                    Divider()
-                    refreshSection
-                    Divider()
-                    aboutSection
-                }
-                .padding(14)
-                .frame(maxWidth: 640, alignment: .leading)   // 宽窗口下别把内容拉散
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+        Form {
+            ghSection
+            refreshSection
+            aboutSection
         }
+        .formStyle(.grouped)
     }
 
     // MARK: GitHub CLI
 
     var ghSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionTitle("GitHub CLI", "PR 的实时状态靠 gh 拉取，它不装、不登录就只能看到本地记的结构")
-
-            HStack(spacing: 8) {
-                if m.detecting {
-                    ProgressView().controlSize(.small)
-                    Text("检测中…").foregroundColor(.secondary)
-                } else if m.gh.ready {
-                    Label("已就绪", systemImage: "checkmark.circle.fill").foregroundColor(.green)
-                    Text(verbatim: "gh \(m.gh.version ?? "?") · 已登录 \(m.gh.account ?? "")")
-                        .foregroundColor(.secondary)
-                } else if m.gh.installed {
-                    Label("已安装，但没登录", systemImage: "person.crop.circle.badge.exclamationmark")
-                        .foregroundColor(.orange)
-                    Text(verbatim: "gh \(m.gh.version ?? "?")").foregroundColor(.secondary)
-                } else {
-                    Label("没找到 gh", systemImage: "xmark.circle.fill").foregroundColor(.red)
-                }
-                Spacer()
-                Button("重新检测") { Task { await m.detectToolchain() } }
-                    .disabled(m.detecting)
-            }
-            .font(.callout)
-
+        Section {
+            LabeledContent("状态") { statusLine }
             if let p = m.gh.path {
-                Text(verbatim: p)
-                    .font(.caption.monospaced())
-                    .foregroundColor(.secondary)
-                    .textSelection(.enabled)
-            }
-
-            actionRow
-            if !m.installLog.isEmpty { installOutput }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("自定义 gh 路径").font(.caption).foregroundColor(.secondary)
-                HStack {
-                    TextField("留空则自动查找", text: $customPath)
-                        .textFieldStyle(.roundedBorder)
+                LabeledContent("可执行文件") {
+                    Text(verbatim: p)
                         .font(.caption.monospaced())
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            LabeledContent("操作") { actionRow }
+            if !m.installLog.isEmpty {
+                installOutput
+            }
+            LabeledContent("自定义路径") {
+                HStack {
+                    // labelsHidden：LabeledContent 里 TextField 自带的 label 会被单独渲染到框外
+                    TextField("留空则自动查找", text: $customPath)
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)   // grouped form 里默认无框，看不出能输入
+                        .font(.caption.monospaced())
+                        .frame(minWidth: 220)
                         .onSubmit { Task { await m.detectToolchain() } }
                     Button("应用") { Task { await m.detectToolchain() } }
                 }
-                Text("装在非常规位置时填这里。自动查找会依次试 Homebrew、MacPorts、PATH，最后问一次登录 shell。")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
             }
-            .padding(.top, 4)
+        } header: {
+            Text("GitHub CLI")
+        } footer: {
+            Text("PR 的实时状态靠 gh 拉取，它不装、不登录就只能看到本地记的结构。"
+                 + "自动查找依次试 Homebrew、MacPorts、PATH，最后问一次登录 shell。")
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    var statusLine: some View {
+        if m.detecting {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("检测中…").foregroundColor(.secondary)
+            }
+        } else if m.gh.ready {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                Text(verbatim: "gh \(m.gh.version ?? "?") · 已登录 \(m.gh.account ?? "")")
+            }
+        } else if m.gh.installed {
+            HStack(spacing: 6) {
+                Image(systemName: "person.crop.circle.badge.exclamationmark").foregroundColor(.orange)
+                Text(verbatim: "gh \(m.gh.version ?? "?") · 没登录")
+            }
+        } else {
+            HStack(spacing: 6) {
+                Image(systemName: "xmark.circle.fill").foregroundColor(.red)
+                Text("没找到 gh")
+            }
         }
     }
 
@@ -1180,14 +1162,13 @@ struct SettingsView: View {
                     Button {
                         Task { await m.installGh() }
                     } label: {
-                        Label(m.installing ? "安装中…" : "用 Homebrew 安装 gh", systemImage: "arrow.down.circle")
+                        Label(m.installing ? "安装中…" : "用 Homebrew 安装", systemImage: "arrow.down.circle")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(m.installing)
                     if m.installing { ProgressView().controlSize(.small) }
                 } else {
                     // 连 brew 都没有，只能给路子，不能替他装
-                    Text("没检测到 Homebrew").foregroundColor(.secondary).font(.callout)
                     Button("安装 Homebrew") { open("https://brew.sh") }
                     Button("下载 gh 安装包") { open("https://github.com/cli/cli/releases/latest") }
                 }
@@ -1198,12 +1179,11 @@ struct SettingsView: View {
                     Label("在终端登录", systemImage: "terminal")
                 }
                 .buttonStyle(.borderedProminent)
-                Text("登录要选协议、按回车开浏览器，只能在终端里完成")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             } else {
                 Button("重新登录") { m.openLoginInTerminal() }
             }
+            Button("重新检测") { Task { await m.detectToolchain() } }
+                .disabled(m.detecting)
         }
     }
 
@@ -1231,42 +1211,38 @@ struct SettingsView: View {
     // MARK: 刷新
 
     var refreshSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("刷新", "每次刷新是一条 GraphQL 请求，把当前项目所有 PR 的状态一起拉回来")
+        Section {
             Picker("自动刷新间隔", selection: $interval) {
                 ForEach(Self.intervals, id: \.0) { Text($0.1).tag($0.0) }
             }
             .pickerStyle(.segmented)
             .onChange(of: interval) { _, _ in m.rescheduleTimer() }
+        } header: {
+            Text("刷新")
+        } footer: {
+            Text("每次刷新是一条 GraphQL 请求，把当前项目所有 PR 的状态一起拉回来。")
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
     }
 
     // MARK: 关于
 
     var aboutSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("关于", nil)
-            Text(verbatim: "PrWaiter \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
-                .font(.callout)
-            HStack {
-                Text(verbatim: Model.dataURL.path)
-                    .font(.caption.monospaced())
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Button("在 Finder 中显示") {
-                    NSWorkspace.shared.activateFileViewerSelecting([Model.dataURL])
+        Section("关于") {
+            LabeledContent("版本", value: ContentView.appVersion)
+            LabeledContent("数据文件") {
+                HStack {
+                    Text(verbatim: Model.dataURL.path)
+                        .font(.caption.monospaced())
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button("显示") {
+                        NSWorkspace.shared.activateFileViewerSelecting([Model.dataURL])
+                    }
+                    .buttonStyle(.link)
                 }
-                .buttonStyle(.link)
-            }
-        }
-    }
-
-    func sectionTitle(_ t: String, _ sub: String?) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(t).font(.headline)
-            if let sub {
-                Text(sub).font(.caption).foregroundColor(.secondary)
             }
         }
     }
@@ -1275,7 +1251,6 @@ struct SettingsView: View {
         if let u = URL(string: url) { NSWorkspace.shared.open(u) }
     }
 }
-
 // MARK: - 缩进连线
 
 /// 一格缩进宽度里画的线
