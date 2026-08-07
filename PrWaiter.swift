@@ -775,24 +775,37 @@ struct ContentView: View {
     @EnvironmentObject var m: Model
     @State private var newPR = ""
     @State private var rootTargeted = false
-    @State private var showSettings = false
+    @State private var page = Page.board
+
+    /// 设置不再弹窗，而是主区域里换一页 —— 看板和设置是同一个界面的两个页面
+    enum Page { case board, settings }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             titleBar
             Divider()
-            projectTabs
-            Divider()
-            if m.editing, m.project != nil {
-                projectSettings
-                Divider()
+            switch page {
+            case .board:
+                boardPage
+            case .settings:
+                SettingsView(onBack: { page = .board })
+                    .environmentObject(m)
+                    .transition(.opacity)
             }
-            content
         }
         .frame(minWidth: 720, minHeight: 480)
-        .sheet(isPresented: $showSettings) {
-            SettingsView().environmentObject(m)
+        .animation(.easeInOut(duration: 0.15), value: page)
+    }
+
+    @ViewBuilder
+    var boardPage: some View {
+        projectTabs
+        Divider()
+        if m.editing, m.project != nil {
+            projectSettings
+            Divider()
         }
+        content
     }
 
     // MARK: 标题栏
@@ -813,21 +826,38 @@ struct ContentView: View {
             Button { Task { await m.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                 .disabled(m.loading)
                 .help("立即刷新")
-            Button { showSettings = true } label: {
-                Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
-                    .foregroundColor(m.gh.ready ? .primary : .orange)
+            // 编辑只对看板有意义
+            if page == .board {
+                Button(m.editing ? "完成" : "编辑") {
+                    m.editing.toggle()
+                    m.save()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(m.editing ? .green : .accentColor)
+                .help(m.editing ? "退出编辑，冻结布局" : "进入编辑，可拖动、增删")
             }
-            .help(m.gh.ready ? "设置" : "gh 还没配好，点这里")
-            Button(m.editing ? "完成" : "编辑") {
-                m.editing.toggle()
-                m.save()
+            // 齿轮是两页之间的开关，摆在最右端 —— 「编辑」隐藏时它才不会移位，
+            // 否则同一个位置点不了第二下
+            Button {
+                page = page == .settings ? .board : .settings
+            } label: {
+                Image(systemName: gearIcon)
+                    .foregroundColor(gearColor)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(m.editing ? .green : .accentColor)
-            .help(m.editing ? "退出编辑，冻结布局" : "进入编辑，可拖动、增删")
+            .help(page == .settings ? "回到看板" : (m.gh.ready ? "设置" : "gh 还没配好，点这里"))
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+
+    var gearIcon: String {
+        if page == .settings { return "gearshape.fill" }
+        return m.gh.ready ? "gearshape" : "gearshape.badge.checkmark"
+    }
+
+    var gearColor: Color {
+        if page == .settings { return .accentColor }
+        return m.gh.ready ? .primary : .orange
     }
 
     // MARK: 项目标签
@@ -916,7 +946,7 @@ struct ContentView: View {
                             Spacer()
                             // gh 没配好是最常见的失败原因，直接给个去处
                             if !m.gh.ready {
-                                Button("去设置") { showSettings = true }
+                                Button("去设置") { page = .settings }
                                     .buttonStyle(.borderedProminent)
                                     .controlSize(.small)
                             }
@@ -1049,7 +1079,7 @@ struct ContentView: View {
 
 struct SettingsView: View {
     @EnvironmentObject var m: Model
-    @Environment(\.dismiss) private var dismiss
+    let onBack: () -> Void
     @AppStorage(Prefs.ghPath) private var customPath = ""
     @AppStorage(Prefs.refreshInterval) private var interval = 60
 
@@ -1057,24 +1087,35 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("设置").font(.title3.weight(.semibold))
+            // 站在项目标签那一行的位置上，两页切换时这一条不会跳
+            HStack(spacing: 8) {
+                Button {
+                    onBack()
+                } label: {
+                    Label("看板", systemImage: "chevron.left")
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.accentColor)
+                .keyboardShortcut(.cancelAction)
+                Text("设置").font(.headline)
                 Spacer()
-                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
             }
-            .padding(14)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
             Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 20) {
                     ghSection
+                    Divider()
                     refreshSection
+                    Divider()
                     aboutSection
                 }
                 .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: 640, alignment: .leading)   // 宽窗口下别把内容拉散
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(width: 520, height: 520)
     }
 
     // MARK: GitHub CLI
