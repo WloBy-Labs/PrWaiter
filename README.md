@@ -246,8 +246,26 @@ swift make-icon.swift /tmp/preview.iconset
 | 再加 `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_PASSWORD` | 额外公证并装订，Gatekeeper 不再警告 |
 
 第二档的证书用 `scripts/make_signing_cert.sh` 生成，它会打印出要贴进
-Settings → Secrets and variables → Actions 的两个值。**生成的 `signing-cert.p12`
-和密码要留好**，每次发版复用同一张，身份才是稳定的。
+Settings → Secrets and variables → Actions 的两个值，同时把证书和密码写到：
+
+```
+~/Library/Application Support/PrWaiter/signing/ci/
+├── ci-signing.p12
+└── ci-signing.password
+```
+
+**不放 `dist/`** —— 那是构建输出目录，语义上随时可以清空，长期密钥搁那儿早晚被误删。
+
+这张证书的全部价值就在于**固定不变**：重新生成就换了身份，装过旧版的用户在系统看来
+等于装了个不同的 App。所以脚本默认拒绝覆盖已有证书，确实要换才用 `FORCE=1`。
+**这个目录务必再备份一份到机器之外**（密码管理器之类）。
+
+要重新取出 Secrets 的值：
+
+```bash
+base64 < ~/Library/Application\ Support/PrWaiter/signing/ci/ci-signing.p12
+cat ~/Library/Application\ Support/PrWaiter/signing/ci/ci-signing.password
+```
 
 第三档需要付费的 Apple 开发者账号，这是去掉 Gatekeeper 警告的唯一途径 ——
 自签证书做不到，别指望。

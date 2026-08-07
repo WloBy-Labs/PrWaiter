@@ -19,11 +19,30 @@ set -euo pipefail
 #   MACOS_CERT_P12       = 打印出来的 base64
 #   MACOS_CERT_PASSWORD  = 打印出来的密码
 #
-# signing-cert.p12 和密码都要留好：每次发版复用同一张证书，身份才是稳定的。
+# 产物落在 ~/Library/Application Support/PrWaiter/signing/ci/，**不是** dist/ ——
+# dist/ 是构建输出目录，语义上随时可以清空，把长期密钥放那儿早晚会被误删。
 
-IDENTITY_NAME="${IDENTITY_NAME:-PrWaiter Signing}"
-OUT_DIR="${OUT_DIR:-$(cd "$(dirname "$0")/.." && pwd)/dist}"
-P12_PATH="$OUT_DIR/signing-cert.p12"
+APP_NAME="PrWaiter"
+IDENTITY_NAME="${IDENTITY_NAME:-$APP_NAME Signing}"
+OUT_DIR="${OUT_DIR:-$HOME/Library/Application Support/$APP_NAME/signing/ci}"
+P12_PATH="$OUT_DIR/ci-signing.p12"
+PASSWORD_PATH="$OUT_DIR/ci-signing.password"
+
+# 这张证书的全部价值就在于「固定不变」。重跑一次就换了身份，之前发的版本
+# 和新版本在系统看来是两个不同的 App。所以默认拒绝覆盖。
+if [[ -f "$P12_PATH" && "${FORCE:-0}" != "1" ]]; then
+    echo "已经有一张证书了：$P12_PATH" >&2
+    echo >&2
+    echo "没有覆盖它 —— 重新生成会换掉签名身份，装过旧版的用户在系统看来" >&2
+    echo "等于装了个不同的 App。要看现有证书的 Secrets 值，跑：" >&2
+    echo >&2
+    echo "  base64 < '$P12_PATH'" >&2
+    echo "  cat '$PASSWORD_PATH'" >&2
+    echo >&2
+    echo "确实要换新身份的话：FORCE=1 zsh scripts/make_signing_cert.sh" >&2
+    exit 1
+fi
+
 P12_PASSWORD="${P12_PASSWORD:-$(openssl rand -base64 18 | tr -d '\n')}"
 
 TEMP_DIR="$(mktemp -d /tmp/pr_waiter_cert.XXXXXX)"
@@ -31,6 +50,7 @@ cleanup() { rm -rf "$TEMP_DIR"; }
 trap cleanup EXIT
 
 mkdir -p "$OUT_DIR"
+chmod 700 "$OUT_DIR"
 
 cat > "$TEMP_DIR/openssl.cnf" <<EOF
 [ req ]
@@ -73,9 +93,13 @@ openssl pkcs12 -export \
     -macalg sha1 \
     -passout "pass:$P12_PASSWORD"
 
-chmod 600 "$P12_PATH"
+# 密码必须落盘。只打印的话，终端一关这张 p12 就是打不开的废文件 ——
+# 比丢了证书还麻烦，因为你会以为自己还有备份。
+printf '%s' "$P12_PASSWORD" > "$PASSWORD_PATH"
+chmod 600 "$P12_PATH" "$PASSWORD_PATH"
 
-echo "Created $P12_PATH"
+echo "已生成 $P12_PATH"
+echo "密码存在 $PASSWORD_PATH"
 echo
 echo "=== GitHub Secret: MACOS_CERT_PASSWORD ==="
 echo "$P12_PASSWORD"
@@ -83,5 +107,5 @@ echo
 echo "=== GitHub Secret: MACOS_CERT_P12 (base64) ==="
 base64 < "$P12_PATH"
 echo
-echo "Add both as repository Actions secrets, then push a tag to release."
-echo "Reuse the SAME signing-cert.p12 for every release to keep permissions."
+echo "两个都加进仓库的 Actions secrets，然后推 tag 即可发版。"
+echo "记得把这个目录再备份一份到机器之外（密码管理器之类）。"
