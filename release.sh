@@ -35,5 +35,6 @@ git fetch -q origin main
 git tag -a "$TAG" -m "PrWaiter $TAG"
 git push origin "$TAG"
 
-echo "已推送 $TAG，GitHub Actions 正在构建并发布："
+# 变量后面紧跟中文逗号时必须加花括号，否则 bash 会把逗号算进变量名
+echo "已推送 ${TAG}，GitHub Actions 正在构建并发布："
 echo "  https://github.com/WloBy-Labs/PrWaiter/actions"
