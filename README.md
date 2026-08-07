@@ -20,17 +20,23 @@ PR 的标题、review 结论、CI 结论、是否已合并，GitHub 全都知道
 
 ## 安装
 
-依赖：
-
-- macOS 14+ 与 Command Line Tools（提供 `swiftc`，**不需要** Xcode 工程）
-- [GitHub CLI](https://cli.github.com/) 且已登录：`brew install gh && gh auth login`
-
-构建并运行：
+构建依赖：macOS 14+ 与 Command Line Tools（提供 `swiftc`，**不需要** Xcode 工程）。
 
 ```bash
 ./build.sh
 open PrWaiter.app
 ```
+
+运行依赖是 [GitHub CLI](https://cli.github.com/)，但**不用先自己装**：
+首次打开如果没检测到 gh，标题栏齿轮会变橙色，进设置面板可以一键用 Homebrew 装，
+装完再点「在终端登录」完成授权。想手动来也行：
+
+```bash
+brew install gh && gh auth login
+```
+
+没有 gh 时 App 不会崩，树结构、描述块、拖拽、折叠都照常可用，
+只是拉不到 PR 的标题和 review / CI 状态 —— 因为本地只存结构，状态是实时拉的。
 
 想常驻的话，把 `PrWaiter.app` 拖进 `/Applications` 即可。
 
@@ -77,8 +83,18 @@ open PrWaiter.app
 | ⏳ 等依赖 | 树上游还有没合并的 PR |
 | ✔ 已合并 / ✕ 已关闭 | 淡化显示，可用顶部「清理已合并」一键移除 |
 
-顶部汇总栏会直接点名当前可以催的 PR。列表每 60 秒自动刷新，也可点刷新按钮手动触发。
-冻结模式下点击 PR 编号可跳转 GitHub。
+顶部汇总栏会直接点名当前可以催的 PR。默认每分钟自动刷新（可在设置里改成 30 秒 / 5 分钟 /
+只手动），也可点刷新按钮手动触发。冻结模式下点击 PR 编号可跳转 GitHub。
+
+### 设置
+
+标题栏齿轮进入，里面有三块：
+
+- **GitHub CLI** —— 显示 gh 的安装与登录状态、版本、可执行文件路径。没装可以一键安装，
+  没登录可以开终端登录。装在非常规位置时可以填自定义路径
+  （自动查找依次试 Homebrew、MacPorts、`PATH`，最后问一次登录 shell）
+- **刷新** —— 自动刷新间隔
+- **关于** —— 版本号与数据文件位置
 
 ### 数据格式
 
