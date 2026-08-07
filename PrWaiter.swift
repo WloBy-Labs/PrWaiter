@@ -472,7 +472,8 @@ final class Model: ObservableObject {
     // 按项目分开缓存：切标签时上一次拉到的数据还在，能立刻显示，不用等网络
     @Published private var liveByProject: [UUID: [Int: LivePR]] = [:]
     @Published private var fetchedAt: [UUID: Date] = [:]
-    @Published var error: String?
+    @Published var error: String?         // 拉取失败
+    @Published var saveError: String?     // 落盘失败 —— 比拉取失败严重，改动是真丢
     @Published var loading = false
     @Published var editing = false
     @Published var gh = GhStatus()
@@ -593,7 +594,17 @@ final class Model: ObservableObject {
     func save() {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? enc.encode(store) { try? data.write(to: Self.dataURL) }
+        do {
+            // .atomic 是关键：它先写同目录下的临时文件再 rename，rename 在文件系统
+            // 层面是原子的。非原子写会先把目标文件截断再往里写，崩在中间就只剩半个
+            // 文件 —— 整份数据都没了。
+            try enc.encode(store).write(to: Self.dataURL, options: .atomic)
+            saveError = nil
+        } catch {
+            // 原来这里是 try?，写失败会被静默吞掉：磁盘满了、权限坏了，界面上
+            // 一点提示都没有，你以为改动存下了其实没有。这比写坏文件更阴险。
+            saveError = error.localizedDescription
+        }
     }
 
     /// 改当前项目并落盘（不触发刷新）
@@ -1101,6 +1112,29 @@ struct ContentView: View {
             ScrollView {
                 // spacing 为 0：每行自带上下留白，连线才能连续不断
                 VStack(alignment: .leading, spacing: 0) {
+                    // 落盘失败排在拉取失败前面：后者只是数据旧了，前者是改动真丢了
+                    if let e = m.saveError {
+                        HStack(spacing: 10) {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("改动没能保存到磁盘").fontWeight(.semibold)
+                                    Text(e).font(.caption)
+                                }
+                            } icon: {
+                                Image(systemName: "externaldrive.badge.xmark")
+                            }
+                            Spacer()
+                            Button("重试") { m.save() }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                        }
+                        .foregroundColor(.red)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.15)))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.red.opacity(0.5)))
+                        .padding(.bottom, 8)
+                    }
                     if let e = m.error {
                         HStack {
                             Label(e, systemImage: "exclamationmark.triangle")
