@@ -1,0 +1,20 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build PrWaiter.app
+        run: ./build.sh
+      - name: Check bundle version matches VERSION
+        run: |
+          expected=$(cat VERSION)
+          actual=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+              PrWaiter.app/Contents/Info.plist)
+          [ "$expected" = "$actual" ] || { echo "版本不一致: $expected != $actual"; exit 1; }

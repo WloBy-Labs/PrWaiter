@@ -1,0 +1,6 @@
+# 构建产物
+PrWaiter.app/
+*.zip
+
+# macOS
+.DS_Store
