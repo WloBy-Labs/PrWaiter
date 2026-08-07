@@ -18,6 +18,8 @@ struct Tests {
         flattenTests()
         collapseTests()
         guideTests()
+        reorderTests()
+        statusTests()
         migrationTests()
         codableTests()
         ghParseTests()
@@ -217,6 +219,109 @@ struct Tests {
     static func isLine(_ g: Guide) -> Bool { if case .line = g { return true }; return false }
     static func isBranch(_ g: Guide) -> Bool { if case .branch = g { return true }; return false }
     static func isLastBranch(_ g: Guide) -> Bool { if case .lastBranch = g { return true }; return false }
+
+    static func reorderTests() {
+        print("根级重排:")
+        // 根级：[topic, c]，topic 下面挂着 a → b
+        let f = fixture()
+        let ids = { (ns: [Node]) in ns.map(\.id) }
+
+        // 往后挪：topic(0) 挪到末尾
+        if let r = Tree.move(f.topic, toRootIndex: 2, in: f.nodes) {
+            check(ids(r) == [f.c, f.topic], "根级块可以挪到末尾")
+            check(r.count == 2, "重排不改变根级数量")
+            check(r.find(f.a) != nil, "重排时子树跟着走")
+        } else {
+            check(false, "应该能挪到末尾")
+        }
+
+        // 往前挪：c(1) 挪到最前
+        if let r = Tree.move(f.c, toRootIndex: 0, in: f.nodes) {
+            check(ids(r) == [f.c, f.topic], "根级块可以挪到最前")
+        } else {
+            check(false, "应该能挪到最前")
+        }
+
+        // 下标换算：往后挪时要减掉自己占的那一格
+        check(Tree.move(f.topic, toRootIndex: 1, in: f.nodes) == nil,
+              "挪到自己后面紧邻的位置等于没动，返回 nil")
+        check(Tree.move(f.topic, toRootIndex: 0, in: f.nodes) == nil,
+              "挪到自己当前位置，返回 nil")
+        check(Tree.move(f.c, toRootIndex: 2, in: f.nodes) == nil,
+              "末位挪到末位，返回 nil")
+
+        // 嵌套节点拖到根级某个位置 = 出组 + 定位
+        if let r = Tree.move(f.b, toRootIndex: 0, in: f.nodes) {
+            check(r.count == 3, "嵌套块拖到根级后根级多一个")
+            check(r.first?.id == f.b, "落在指定位置")
+            check(r.find(f.a)?.children.isEmpty == true, "原来的父块空了")
+        } else {
+            check(false, "嵌套块应该能拖到根级")
+        }
+
+        // 越界与不存在
+        check(Tree.move(f.c, toRootIndex: 99, in: f.nodes) == nil, "越界且等于原位，返回 nil")
+        check(Tree.move(UUID(), toRootIndex: 0, in: f.nodes) == nil, "拖不存在的块，返回 nil")
+        if let r = Tree.move(f.b, toRootIndex: 99, in: f.nodes) {
+            check(r.last?.id == f.b, "越界下标被夹到末尾")
+        } else {
+            check(false, "越界应该被夹住而不是失败")
+        }
+    }
+
+    static func statusTests() {
+        print("状态分类:")
+        func lv(state: String = "OPEN", draft: Bool = false,
+                review: String? = nil, ci: String? = nil) -> LivePR {
+            var v = LivePR()
+            v.state = state
+            v.isDraft = draft
+            v.review = review
+            v.ci = ci
+            return v
+        }
+
+        check(Model.classify(nil, blocked: false) == .unknown, "拉不到数据是未知")
+        check(Model.classify(lv(state: "MERGED"), blocked: true) == .merged, "已合并压倒一切")
+        check(Model.classify(lv(state: "CLOSED"), blocked: true) == .closed, "已关闭压倒一切")
+        check(Model.classify(lv(draft: true, review: "APPROVED", ci: "SUCCESS"), blocked: false) == .draft,
+              "草稿即使批准且 CI 绿也还是草稿")
+
+        // 自己这边的问题排在「等依赖」前面：被挡着也该先修
+        check(Model.classify(lv(ci: "FAILURE"), blocked: true) == .ciFailed, "CI 失败优先于等依赖")
+        check(Model.classify(lv(ci: "ERROR"), blocked: false) == .ciFailed, "ERROR 也算 CI 失败")
+        check(Model.classify(lv(review: "CHANGES_REQUESTED"), blocked: true) == .changesRequested,
+              "需修改优先于等依赖")
+
+        check(Model.classify(lv(review: "APPROVED", ci: "SUCCESS"), blocked: true) == .blocked,
+              "万事俱备但上游没合，是等依赖")
+        check(Model.classify(lv(review: "APPROVED", ci: "PENDING"), blocked: false) == .ciRunning,
+              "CI 跑着呢")
+        check(Model.classify(lv(review: "APPROVED", ci: "EXPECTED"), blocked: false) == .ciRunning,
+              "EXPECTED 也算跑着")
+        check(Model.classify(lv(review: "REVIEW_REQUIRED", ci: "SUCCESS"), blocked: false) == .needsReview,
+              "CI 绿了但还没批准，是等 review")
+        check(Model.classify(lv(ci: "SUCCESS"), blocked: false) == .needsReview,
+              "没有 review 结论也算等 review")
+
+        check(Model.classify(lv(review: "APPROVED", ci: "SUCCESS"), blocked: false) == .ready,
+              "批准 + CI 绿 + 无阻塞才是可合并")
+        check(Model.classify(lv(review: "APPROVED", ci: nil), blocked: false) == .ready,
+              "仓库没配 CI 时，批准即可合并")
+
+        // 分类互斥，所以描述块上的分项加起来必然等于 PR 总数
+        let cases = [
+            lv(state: "MERGED"), lv(draft: true), lv(ci: "FAILURE"),
+            lv(review: "CHANGES_REQUESTED"), lv(review: "APPROVED", ci: "SUCCESS"),
+        ]
+        let kinds = Set(cases.map { Model.classify($0, blocked: false) })
+        check(kinds.count == cases.count, "不同情形落在不同桶里，分类互斥")
+
+        check(PRStatus.merged.isSettled && PRStatus.closed.isSettled, "已合并/已关闭算尘埃落定")
+        check(!PRStatus.ready.isSettled, "可合并还需要盯着")
+        check(Set(PRStatus.summaryOrder).count == PRStatus.allCases.count,
+              "分项排列顺序覆盖了所有状态，不会漏显示")
+    }
 
     static func migrationTests() {
         print("0.1.0 数据迁移:")
