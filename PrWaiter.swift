@@ -17,6 +17,7 @@ struct Node: Codable, Identifiable {
     var title = ""      // 描述块的文字；PR 节点用不上（标题实时拉）
     var pr: Int?        // kind == .pr 时有效
     var note = ""
+    var collapsed = false
     var children: [Node] = []
 
     init(kind: NodeKind, title: String = "", pr: Int? = nil, note: String = "") {
@@ -31,7 +32,7 @@ struct Node: Codable, Identifiable {
         id == target || children.contains { $0.contains(target) }
     }
 
-    enum CodingKeys: String, CodingKey { case id, kind, title, pr, note, children }
+    enum CodingKeys: String, CodingKey { case id, kind, title, pr, note, collapsed, children }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -40,6 +41,7 @@ struct Node: Codable, Identifiable {
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
         pr = try c.decodeIfPresent(Int.self, forKey: .pr)
         note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
+        collapsed = try c.decodeIfPresent(Bool.self, forKey: .collapsed) ?? false
         children = try c.decodeIfPresent([Node].self, forKey: .children) ?? []
     }
 
@@ -51,6 +53,7 @@ struct Node: Codable, Identifiable {
         if !title.isEmpty { try c.encode(title, forKey: .title) }
         if let pr { try c.encode(pr, forKey: .pr) }
         if !note.isEmpty { try c.encode(note, forKey: .note) }
+        if collapsed { try c.encode(collapsed, forKey: .collapsed) }
         if !children.isEmpty { try c.encode(children, forKey: .children) }
     }
 }
@@ -122,7 +125,45 @@ extension Array where Element == Node {
     }
 }
 
+/// 树铺平成一行一行，带上画缩进连线所需的信息
+struct Row: Identifiable {
+    let node: Node
+    let depth: Int
+    let blocked: Bool       // 头上还有没合并的 PR 祖先
+    let hidden: Bool        // 被某个折叠起来的祖先藏着
+    let isLast: Bool        // 是不是同级里的最后一个
+    /// 各层祖先「是否为该层最后一个」，长度等于 depth。
+    /// 画竖线时用：祖先不是最后一个，说明它下面还有兄弟，那一列就要continue 竖线。
+    let trail: [Bool]
+    let descendants: Int    // 子孙总数，折叠时显示藏了多少
+
+    var id: UUID { node.id }
+}
+
 enum Tree {
+    /// 铺平整棵树。isMerged 由调用方提供（实时状态不属于树本身），这样这个函数是纯的、可测的。
+    static func flatten(_ nodes: [Node], isMerged: (Int) -> Bool) -> [Row] {
+        func countAll(_ ns: [Node]) -> Int {
+            ns.reduce(0) { $0 + 1 + countAll($1.children) }
+        }
+        func walk(_ ns: [Node], _ depth: Int, _ blocked: Bool, _ hidden: Bool, _ trail: [Bool]) -> [Row] {
+            ns.enumerated().flatMap { i, n -> [Row] in
+                let isLast = i == ns.count - 1
+                let row = Row(
+                    node: n, depth: depth, blocked: blocked, hidden: hidden,
+                    isLast: isLast, trail: trail, descendants: countAll(n.children)
+                )
+                // 描述块只做分组，不参与先后关系；PR 没合并才挡住下面的
+                let childBlocked = n.kind == .pr
+                    ? blocked || !(n.pr.map(isMerged) ?? false)
+                    : blocked
+                return [row] + walk(n.children, depth + 1, childBlocked, hidden || n.collapsed,
+                                    trail + [isLast])
+            }
+        }
+        return walk(nodes, 0, false, false, [])
+    }
+
     /// 把 dragged 挂到 target 下面；target 为 nil 表示挪到根级。
     /// 非法移动（成环、描述块想当子节点、目标不存在）返回 nil，调用方原样保留。
     static func move(_ dragged: UUID, under target: UUID?, in nodes: [Node]) -> [Node]? {
@@ -137,6 +178,7 @@ enum Tree {
         nodes.detach(dragged)
         if let target {
             guard nodes.attach(node, under: target) else { return nil }
+            nodes.update(target) { $0.collapsed = false }   // 别让拖进去的东西看起来「消失」了
         } else {
             nodes.append(node)
         }
@@ -464,35 +506,24 @@ final class Model: ObservableObject {
     }
 }
 
-// MARK: - 铺平成带缩进的行
-
-struct Row: Identifiable {
-    let node: Node
-    let depth: Int
-    let blocked: Bool   // 头上还有没合并的 PR 祖先
-    var id: UUID { node.id }
-}
+// MARK: - 行与统计
+//
+// 统计一律基于 allRows —— 折叠只是把行藏起来，不该让 PR 从汇总里消失。
 
 extension Model {
+    /// 整棵树的所有行，含被折叠藏起来的
+    var allRows: [Row] {
+        Tree.flatten(project?.nodes ?? []) { live[$0]?.state == "MERGED" }
+    }
+
+    /// 实际渲染的行
     var rows: [Row] {
-        func walk(_ nodes: [Node], _ depth: Int, _ blocked: Bool) -> [Row] {
-            nodes.flatMap { n -> [Row] in
-                let childBlocked: Bool
-                if n.kind == .pr, let p = n.pr {
-                    childBlocked = blocked || live[p]?.state != "MERGED"
-                } else {
-                    childBlocked = blocked   // 描述块不参与先后关系
-                }
-                return [Row(node: n, depth: depth, blocked: blocked)]
-                    + walk(n.children, depth + 1, childBlocked)
-            }
-        }
-        return walk(project?.nodes ?? [], 0, false)
+        allRows.filter { !$0.hidden }
     }
 
     /// 每个描述块下辖的 PR 数与其中可合并的数量
     var topicSummary: [UUID: (total: Int, ready: Int)] {
-        let all = rows
+        let all = allRows
         var out: [UUID: (Int, Int)] = [:]
         for (i, row) in all.enumerated() where row.node.kind == .topic {
             var total = 0, ready = 0
@@ -509,20 +540,19 @@ extension Model {
         return out
     }
 
-    var readyPRs: [Int] {
-        rows.compactMap { r in
+    func prs(matching wanted: PRStatus) -> [Int] {
+        allRows.compactMap { r in
             guard r.node.kind == .pr, let p = r.node.pr,
-                  status(pr: p, blocked: r.blocked) == .ready else { return nil }
+                  status(pr: p, blocked: r.blocked) == wanted else { return nil }
             return p
         }
     }
 
-    var mergedPRs: [Int] {
-        rows.compactMap { r in
-            guard r.node.kind == .pr, let p = r.node.pr,
-                  status(pr: p, blocked: r.blocked) == .merged else { return nil }
-            return p
-        }
+    var readyPRs: [Int] { prs(matching: .ready) }
+    var mergedPRs: [Int] { prs(matching: .merged) }
+
+    func toggleCollapse(_ id: UUID) {
+        edit { $0.nodes.update(id) { $0.collapsed.toggle() } }
     }
 }
 
@@ -656,16 +686,18 @@ struct ContentView: View {
             emptyProjects
         } else {
             ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
+                // spacing 为 0：每行自带上下留白，连线才能连续不断
+                VStack(alignment: .leading, spacing: 0) {
                     if let e = m.error {
                         Label(e, systemImage: "exclamationmark.triangle")
                             .foregroundColor(.red)
                             .padding(8)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.1)))
+                            .padding(.bottom, 8)
                     }
-                    summary
-                    if m.editing { addBar }
+                    summary.padding(.bottom, 6)
+                    if m.editing { addBar.padding(.bottom, 6) }
                     ForEach(m.rows) { row in
                         NodeRow(row: row)
                     }
@@ -676,7 +708,7 @@ struct ContentView: View {
                             .foregroundColor(.secondary)
                             .padding(.top, 20)
                     }
-                    if m.editing { rootDropZone }
+                    if m.editing { rootDropZone.padding(.top, 8) }
                 }
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -782,6 +814,61 @@ struct ContentView: View {
     }
 }
 
+// MARK: - 缩进连线
+
+/// 一格缩进宽度里画的线
+enum Guide {
+    case blank      // 这一层的祖先已经是最后一个了，不画
+    case line       // │  祖先下面还有兄弟，竖线穿过去
+    case branch     // ├─ 连到自己，且自己下面还有兄弟
+    case lastBranch // └─ 连到自己，自己是最后一个
+}
+
+struct GuideCell: View {
+    let guide: Guide
+    static let width: CGFloat = 26
+
+    var body: some View {
+        GeometryReader { g in
+            Path { p in
+                let x = Self.width / 2
+                let midY = g.size.height / 2
+                switch guide {
+                case .blank:
+                    break
+                case .line:
+                    p.move(to: CGPoint(x: x, y: 0))
+                    p.addLine(to: CGPoint(x: x, y: g.size.height))
+                case .branch:
+                    p.move(to: CGPoint(x: x, y: 0))
+                    p.addLine(to: CGPoint(x: x, y: g.size.height))
+                    p.move(to: CGPoint(x: x, y: midY))
+                    p.addLine(to: CGPoint(x: g.size.width, y: midY))
+                case .lastBranch:
+                    p.move(to: CGPoint(x: x, y: 0))
+                    p.addLine(to: CGPoint(x: x, y: midY))
+                    p.addLine(to: CGPoint(x: g.size.width, y: midY))
+                }
+            }
+            .stroke(Color.secondary.opacity(0.35), lineWidth: 1)
+        }
+        .frame(width: Self.width)
+    }
+}
+
+extension Row {
+    /// 这一行左边每一格该画什么
+    var guides: [Guide] {
+        guard depth > 0 else { return [] }
+        return (0..<depth).map { i in
+            if i < depth - 1 {
+                return trail[i] ? .blank : .line   // 祖先是最后一个就不用continue 竖线
+            }
+            return isLast ? .lastBranch : .branch
+        }
+    }
+}
+
 // MARK: - 单行（描述块 / PR）
 
 struct NodeRow: View {
@@ -792,21 +879,65 @@ struct NodeRow: View {
     @State private var confirmDelete = false
 
     var body: some View {
-        Group {
-            if row.node.kind == .topic { topicBody } else { prBody }
+        // 连线格和卡片并排，格子撑满整行高度（含上下留白），竖线才能连起来不断
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(Array(row.guides.enumerated()), id: \.offset) { _, g in
+                GuideCell(guide: g)
+            }
+            card
+                .padding(.vertical, 4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(targeted ? Color.accentColor : .clear, lineWidth: 2)
+                        .padding(.vertical, 4)
+                )
+                .modifier(DragEnabled(enabled: m.editing, id: row.node.id))
+                .dropDestination(for: String.self) { items, _ in
+                    guard m.editing, let id = items.first.flatMap(UUID.init) else { return false }
+                    m.move(id, under: row.node.id)
+                    return true
+                } isTargeted: { targeted = m.editing && $0 }
         }
-        .padding(.leading, CGFloat(row.depth) * 26)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(targeted ? Color.accentColor : .clear, lineWidth: 2)
-                .padding(.leading, CGFloat(row.depth) * 26)
-        )
-        .modifier(DragEnabled(enabled: m.editing, id: row.node.id))
-        .dropDestination(for: String.self) { items, _ in
-            guard m.editing, let id = items.first.flatMap(UUID.init) else { return false }
-            m.move(id, under: row.node.id)
-            return true
-        } isTargeted: { targeted = m.editing && $0 }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    var card: some View {
+        if row.node.kind == .topic { topicBody } else { prBody }
+    }
+
+    /// 折叠三角。冻结模式下也能用 —— 折叠只是换个看法，不算改内容。
+    @ViewBuilder
+    var chevron: some View {
+        if row.node.children.isEmpty {
+            Color.clear.frame(width: 14)
+        } else {
+            Button {
+                m.toggleCollapse(row.node.id)
+            } label: {
+                Image(systemName: row.node.collapsed ? "chevron.right" : "chevron.down")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+                    .frame(width: 14)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(row.node.collapsed ? "展开" : "折叠")
+        }
+    }
+
+    /// 折叠时提示里面藏了多少块
+    @ViewBuilder
+    var collapsedBadge: some View {
+        if row.node.collapsed, row.descendants > 0 {
+            Text(verbatim: "▸ \(row.descendants)")
+                .font(.caption2)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                .foregroundColor(.secondary)
+                .help("折叠了 \(row.descendants) 个块")
+        }
     }
 
     // MARK: 描述块
@@ -815,6 +946,7 @@ struct NodeRow: View {
         let sum = m.topicSummary[row.node.id] ?? (total: 0, ready: 0)
         return HStack(spacing: 8) {
             if m.editing { grip }
+            chevron
             Image(systemName: "text.bubble").foregroundColor(.accentColor)
             if m.editing {
                 TextField("写点什么，比如「修复 spill 内存统计」", text: Binding(
@@ -829,6 +961,7 @@ struct NodeRow: View {
                     .foregroundColor(row.node.title.isEmpty ? .secondary : .primary)
             }
             Spacer()
+            collapsedBadge
             if sum.total > 0 {
                 Text(verbatim: "\(sum.total) 个 PR" + (sum.ready > 0 ? " · \(sum.ready) 个可合并" : ""))
                     .font(.caption)
@@ -850,6 +983,7 @@ struct NodeRow: View {
         return VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 8) {
                 if m.editing { grip }
+                chevron
                 // 一律 verbatim：PR 编号是标识符，不能被本地化成 "#77,255"
                 if let lv, let u = URL(string: lv.url), !m.editing {
                     Link(destination: u) { Text(verbatim: "#\(num)") }
@@ -862,6 +996,7 @@ struct NodeRow: View {
                     .lineLimit(1)
                     .foregroundColor(st == .merged ? .secondary : .primary)
                 Spacer()
+                collapsedBadge
                 badges(lv)
                 Text(st.label).font(.caption).foregroundColor(st.color)
                 if m.editing { deleteButton }
