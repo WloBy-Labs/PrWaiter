@@ -15,6 +15,9 @@ struct Tests {
     static func main() {
         moveTests()
         deleteTests()
+        flattenTests()
+        collapseTests()
+        guideTests()
         migrationTests()
         codableTests()
 
@@ -104,6 +107,116 @@ struct Tests {
         f.nodes = nodes
     }
 
+    static func flattenTests() {
+        print("铺平与先后关系:")
+        let f = fixture()
+        let none = Tree.flatten(f.nodes) { _ in false }
+
+        check(none.count == 4, "所有节点都铺出来了")
+        check(none.map(\.depth) == [0, 1, 2, 0], "层级正确")
+        check(none.allSatisfy { !$0.hidden }, "没折叠时全部可见")
+
+        check(none[0].blocked == false, "根级描述块不被挡")
+        check(none[1].blocked == false, "描述块不参与先后关系，其子 PR 不被挡")
+        check(none[2].blocked == true, "父 PR 没合并时子 PR 被挡")
+        check(none[3].blocked == false, "根级 PR 不被挡")
+
+        // 父 PR 合并后，子 PR 解除阻塞
+        let merged = Tree.flatten(f.nodes) { $0 == 1 }
+        check(merged[2].blocked == false, "父 PR 合并后子 PR 解除阻塞")
+
+        // 阻塞会沿着链条传递
+        let deep = Tree.flatten(f.nodes) { $0 == 2 }
+        check(deep[2].blocked == true, "祖先没合并时，即使自己合并了下游仍被挡")
+
+        check(none[0].descendants == 2, "描述块子孙数含孙子")
+        check(none[1].descendants == 1, "PR 子孙数正确")
+        check(none[3].descendants == 0, "叶子没有子孙")
+    }
+
+    static func collapseTests() {
+        print("折叠:")
+        var f = fixture()
+
+        var nodes = f.nodes
+        nodes.update(f.topic) { $0.collapsed = true }
+        let rows = Tree.flatten(nodes) { _ in false }
+        check(rows.count == 4, "折叠不改变行总数，只是标记隐藏")
+        check(rows.filter { !$0.hidden }.count == 2, "折叠描述块后只剩两行可见")
+        check(rows.first { $0.node.id == f.topic }?.hidden == false, "折叠的块自身仍可见")
+        check(rows.first { $0.node.id == f.a }?.hidden == true, "子节点被藏起来")
+        check(rows.first { $0.node.id == f.b }?.hidden == true, "孙节点也被藏起来")
+        check(rows.first { $0.node.id == f.c }?.hidden == false, "别的根级块不受影响")
+
+        // 折叠中间节点只藏它自己下面的
+        nodes = f.nodes
+        nodes.update(f.a) { $0.collapsed = true }
+        let mid = Tree.flatten(nodes) { _ in false }
+        check(mid.first { $0.node.id == f.a }?.hidden == false, "折叠的中间节点自身可见")
+        check(mid.first { $0.node.id == f.b }?.hidden == true, "它的子节点被藏")
+
+        // 统计不受折叠影响 —— 折叠了也不能让 PR 从汇总里消失
+        check(mid.filter { $0.node.kind == .pr }.count == 3, "折叠后 PR 总数不变")
+
+        // 拖进折叠的块会自动展开
+        nodes = f.nodes
+        nodes.update(f.topic) { $0.collapsed = true }
+        if let moved = Tree.move(f.c, under: f.topic, in: nodes) {
+            check(moved.find(f.topic)?.collapsed == false, "拖进折叠的块会自动展开")
+        } else {
+            check(false, "应该能拖进折叠的块")
+        }
+
+        f.nodes = nodes
+    }
+
+    static func guideTests() {
+        print("缩进连线:")
+        // topic ─┬ #1 ── #2 ── #5     c(#3) 是根级最后一个
+        //        └ #4
+        let e = Node(kind: .pr, pr: 5)
+        var b = Node(kind: .pr, pr: 2)
+        b.children = [e]
+        var a = Node(kind: .pr, pr: 1)
+        a.children = [b]
+        let d = Node(kind: .pr, pr: 4)
+        var topic = Node(kind: .topic, title: "T")
+        topic.children = [a, d]
+        let c = Node(kind: .pr, pr: 3)
+        let rows = Tree.flatten([topic, c]) { _ in false }
+
+        let byPR = { (n: Int) in rows.first { $0.node.pr == n }! }
+        check(rows[0].guides.isEmpty, "根级不画连线")
+        check(rows[0].isLast == false, "根级描述块后面还有块")
+        check(rows.last!.isLast, "根级最后一个块标记正确")
+
+        // #1 是 topic 的第一个孩子，后面还有 #4
+        check(byPR(1).guides.count == 1, "深度 1 画一格")
+        check(isBranch(byPR(1).guides[0]), "还有兄弟时画 ├")
+        check(isLastBranch(byPR(4).guides[0]), "最后一个兄弟画 └")
+
+        // #2 在深度 2：第 0 格看 topic（后面还有 c），要穿竖线；第 1 格是自己的拐角
+        check(byPR(2).guides.count == 2, "深度 2 画两格")
+        check(isLine(byPR(2).guides[0]), "祖先后面还有兄弟时，穿过去画竖线")
+        check(isLastBranch(byPR(2).guides[1]), "自己是独子，画 └")
+
+        // #5 在深度 3：第 1 格看祖先 #1，它后面还有 #4，所以要穿竖线
+        check(byPR(5).guides.count == 3, "深度 3 画三格")
+        check(isLine(byPR(5).guides[1]), "中间祖先后面还有兄弟时，那一列穿竖线")
+
+        // 把 #4 删掉后 #1 成了最后一个，#5 的那一列就该留空
+        var nodes = [topic, c]
+        nodes.removePromotingChildren(d.id)
+        let after = Tree.flatten(nodes) { _ in false }
+        check(isBlank(after.first { $0.node.pr == 5 }!.guides[1]),
+              "祖先已是最后一个时，那一列留空")
+    }
+
+    static func isBlank(_ g: Guide) -> Bool { if case .blank = g { return true }; return false }
+    static func isLine(_ g: Guide) -> Bool { if case .line = g { return true }; return false }
+    static func isBranch(_ g: Guide) -> Bool { if case .branch = g { return true }; return false }
+    static func isLastBranch(_ g: Guide) -> Bool { if case .lastBranch = g { return true }; return false }
+
     static func migrationTests() {
         print("0.1.0 数据迁移:")
         let legacy = """
@@ -157,6 +270,15 @@ struct Tests {
         // 空字段不落盘
         let json = String(data: data, encoding: .utf8)!
         check(!json.contains("\"note\""), "空备注不写进 JSON")
+        check(!json.contains("\"collapsed\""), "没折叠时不写 collapsed")
+
+        // 折叠状态要能持久化
+        var withCollapse = store
+        withCollapse.projects[0].nodes.update(f.topic) { $0.collapsed = true }
+        let d2 = try! JSONEncoder().encode(withCollapse)
+        check(String(data: d2, encoding: .utf8)!.contains("\"collapsed\""), "折叠了才写 collapsed")
+        let back2 = try! JSONDecoder().decode(Store.self, from: d2)
+        check(back2.projects[0].nodes.find(f.topic)?.collapsed == true, "折叠状态往返保留")
 
         // 缺字段的手写 JSON 也要能读
         let handwritten = """
