@@ -19,6 +19,7 @@ struct Tests {
         collapseTests()
         guideTests()
         reorderTests()
+        projectReorderTests()
         statusTests()
         migrationTests()
         codableTests()
@@ -267,6 +268,45 @@ struct Tests {
         } else {
             check(false, "越界应该被夹住而不是失败")
         }
+    }
+
+    static func projectReorderTests() {
+        print("项目标签重排:")
+        let a = Project(name: "A"), b = Project(name: "B"), c = Project(name: "C")
+        let ps = [a, b, c]
+        let names = { (x: [Project]) in x.map(\.name) }
+
+        if let r = Store.moveProject(c.id, toIndex: 0, in: ps) {
+            check(names(r) == ["C", "A", "B"], "末尾的标签可以挪到最前")
+        } else {
+            check(false, "应该能挪到最前")
+        }
+
+        if let r = Store.moveProject(a.id, toIndex: 3, in: ps) {
+            check(names(r) == ["B", "C", "A"], "最前的标签可以挪到末尾")
+        } else {
+            check(false, "应该能挪到末尾")
+        }
+
+        if let r = Store.moveProject(a.id, toIndex: 2, in: ps) {
+            check(names(r) == ["B", "A", "C"], "往后挪时下标要减掉自己占的那一格")
+        } else {
+            check(false, "应该能挪到中间")
+        }
+
+        check(Store.moveProject(a.id, toIndex: 0, in: ps) == nil, "挪到自己当前位置，返回 nil")
+        check(Store.moveProject(a.id, toIndex: 1, in: ps) == nil, "挪到自己后面紧邻的位置等于没动")
+        check(Store.moveProject(c.id, toIndex: 3, in: ps) == nil, "末位挪到末位，返回 nil")
+
+        // 拖块的时候飘到标签栏上，传进来的是块 id，不该误伤项目顺序
+        check(Store.moveProject(UUID(), toIndex: 0, in: ps) == nil, "不是项目 id 时当没发生")
+        check(Store.moveProject(a.id, toIndex: 0, in: []) == nil, "空列表不炸")
+
+        // 反过来：拖标签飘到块的投放区上，也不该动树
+        var node = Node(kind: .topic, title: "T")
+        node.children = [Node(kind: .pr, pr: 1)]
+        check(Tree.move(a.id, toRootIndex: 0, in: [node]) == nil, "项目 id 落到块的缝里当没发生")
+        check(Tree.move(a.id, under: node.id, in: [node]) == nil, "项目 id 落到块身上当没发生")
     }
 
     static func statusTests() {

@@ -239,6 +239,20 @@ struct Store: Codable {
         selected = try c.decodeIfPresent(UUID.self, forKey: .selected)
     }
 
+    /// 把项目挪到第 index 个位置（index 是「插到谁前面」，等于 count 表示放末尾）。
+    /// 和根级块重排是同一套下标换算，非法或原地不动返回 nil。
+    static func moveProject(_ id: UUID, toIndex index: Int, in projects: [Project]) -> [Project]? {
+        guard let from = projects.firstIndex(where: { $0.id == id }) else { return nil }
+        var to = index
+        if from < index { to -= 1 }   // 摘掉自己之后，后面的位置都往前挪了一格
+        var out = projects
+        let p = out.remove(at: from)
+        to = max(0, min(to, out.count))
+        guard to != from else { return nil }
+        out.insert(p, at: to)
+        return out
+    }
+
     /// 0.1.0 的格式是 {repo, prs:[{pr, after, note}]}，读到就迁移成单个项目。
     static func migrateLegacy(_ data: Data) -> Store? {
         struct LegacyPR: Codable {
@@ -601,6 +615,14 @@ final class Model: ObservableObject {
         guard let i = projectIndex,
               let moved = Tree.move(dragged, under: target, in: store.projects[i].nodes) else { return }
         store.projects[i].nodes = moved
+        save()
+    }
+
+    /// 拖动项目标签排序。传进来的可能是块的 id（拖块时飘到标签栏上），
+    /// 那样 firstIndex 找不到，直接当没发生。
+    func moveProject(_ id: UUID, toIndex index: Int) {
+        guard let moved = Store.moveProject(id, toIndex: index, in: store.projects) else { return }
+        store.projects = moved
         save()
     }
 
@@ -1000,25 +1022,12 @@ struct ContentView: View {
     var projectTabs: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                ForEach(m.store.projects) { p in
-                    let active = p.id == m.store.selected
-                    Button { m.select(p.id) } label: {
-                        Text(p.name.isEmpty ? "未命名" : p.name)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(active ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.12))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(active ? Color.accentColor : .clear, lineWidth: 1)
-                            )
-                            .foregroundColor(active ? .accentColor : .primary)
-                    }
-                    .buttonStyle(.plain)
+                ForEach(Array(m.store.projects.enumerated()), id: \.element.id) { i, p in
+                    if m.editing { TabGap(index: i) }
+                    tab(p)
                 }
                 if m.editing {
+                    TabGap(index: m.store.projects.count)   // 末尾那条缝
                     Button {
                         let p = Project(name: "新项目")
                         m.store.projects.append(p)
@@ -1033,6 +1042,28 @@ struct ContentView: View {
             .padding(.vertical, 2)   // 内外边距交给控制条统一控制
         }
         .frame(maxWidth: .infinity, alignment: .leading)   // 标签占满剩余宽度，按钮靠右
+    }
+
+    /// 用普通视图 + 点击手势而不是 Button：Button 会吞掉拖拽手势，
+    /// 而节点卡片正是「普通视图 + draggable」这个结构，拖拽已验证可用
+    func tab(_ p: Project) -> some View {
+        let active = p.id == m.store.selected
+        return Text(p.name.isEmpty ? "未命名" : p.name)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(active ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(active ? Color.accentColor : .clear, lineWidth: 1)
+            )
+            .foregroundColor(active ? .accentColor : .primary)
+            .contentShape(Rectangle())
+            .onTapGesture { m.select(p.id) }
+            .modifier(DragEnabled(enabled: m.editing, id: p.id))
+            .help(m.editing ? "拖动可调整标签顺序" : p.repo)
     }
 
     // MARK: 项目设置（编辑态）
@@ -1441,6 +1472,35 @@ struct RootGap: View {
         .dropDestination(for: String.self) { items, _ in
             guard let id = items.first.flatMap(UUID.init) else { return false }
             m.move(id, toRootIndex: index)
+            return true
+        } isTargeted: { targeted = $0 }
+    }
+}
+
+// MARK: - 标签之间的插入缝
+
+/// 项目标签之间的投放缝，和根级块的 RootGap 是一回事，只是插入线是竖的
+struct TabGap: View {
+    @EnvironmentObject var m: Model
+    let index: Int
+    @State private var targeted = false
+
+    var body: some View {
+        ZStack {
+            Color.clear
+            Capsule()
+                .fill(Color.accentColor)
+                .frame(width: 3)
+                .padding(.vertical, 1)
+                .opacity(targeted ? 1 : 0)
+        }
+        // 高度必须写死：Color.clear 没有固有高度，只约束宽度的话会把整条标签栏撑满
+        .frame(width: 10, height: 26)
+        .contentShape(Rectangle())
+        .dropDestination(for: String.self) { items, _ in
+            guard let id = items.first.flatMap(UUID.init) else { return false }
+            // 拖的可能是块（飘到标签栏上了），那样 id 不是项目，moveProject 会当没发生
+            m.moveProject(id, toIndex: index)
             return true
         } isTargeted: { targeted = $0 }
     }
