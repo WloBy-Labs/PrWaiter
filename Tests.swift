@@ -311,53 +311,94 @@ struct Tests {
     }
 
     static func autoImportTests() {
-        print("自动导入 open PR:")
-        let nodes = [Node(kind: .pr, pr: 100), Node(kind: .pr, pr: 101)]
+        print("自动导入与 backport 聚合:")
 
-        // 全新的导进来，落在最前面
-        if let r = Project.importing([100, 101, 200, 201], nodes: nodes, imported: [100, 101]) {
-            check(r.nodes.count == 4, "两个新 PR 都进来了")
-            check(r.nodes.map(\.pr) == [201, 200, 100, 101], "新的排在最前，编号大的在最上")
-            check(r.imported == [100, 101, 200, 201], "imported 记上了新导入的")
+        func open(_ n: Int, _ t: String = "") -> FoundPR { FoundPR(number: n, title: t, isOpen: true) }
+        func shut(_ n: Int, _ t: String = "") -> FoundPR { FoundPR(number: n, title: t, isOpen: false) }
+
+        // --- 标题解析 ---
+        check(GhParse.backportParent(from: "[BugFix] xxx (backport #77408)") == 77408,
+              "解析 StarRocks 的 (backport #N)")
+        check(GhParse.backportParent(from: "Backport of #123 to 3.5") == 123, "解析 backport of #N")
+        check(GhParse.backportParent(from: "cherry-pick #99") == 99, "解析 cherry-pick #N")
+        check(GhParse.backportParent(from: "Cherry picked from #77") == 77, "解析 cherry picked from #N")
+        check(GhParse.backportParent(from: "[BugFix] 普通 PR，没有 backport 字样") == nil,
+              "主干 PR 解析不出父 PR")
+        check(GhParse.backportParent(from: "fix #123 crash") == nil,
+              "只是引用了 issue，不是 backport，不能误判")
+
+        // --- open 一律收，没有父 PR 的落根级顶部 ---
+        let base = [Node(kind: .pr, pr: 100)]
+        if let r = Project.importing([open(200), open(201)], nodes: base, imported: [100]) {
+            check(r.nodes.map(\.pr) == [201, 200, 100], "open 的落在根级顶部，编号大的在最上")
         } else {
-            check(false, "有新 PR 时应该返回改动")
+            check(false, "open 的应该被导入")
         }
 
-        // 没有新的就不动
-        check(Project.importing([100, 101], nodes: nodes, imported: [100, 101]) == nil,
-              "没有新 PR 时返回 nil，不白写一次盘")
-        check(Project.importing([], nodes: nodes, imported: [100, 101]) == nil,
-              "一个 open PR 都没有时也不动")
-
-        // 删掉的不该被导回来 —— 这是 imported 存在的全部理由
-        check(Project.importing([100, 101], nodes: [Node(kind: .pr, pr: 100)], imported: [100, 101]) == nil,
-              "删掉的 open PR 不会被重新导入")
-
-        // 手工加过的 PR 要补记进 imported，否则删掉后会被导回来
-        if let r = Project.importing([100], nodes: nodes, imported: []) {
-            check(r.nodes.count == 2, "手工加过的不重复导入")
-            check(r.imported == [100, 101], "树里已有的都补记进 imported")
+        // --- backport 自动挂到父 PR 下面 ---
+        if let r = Project.importing([open(200, "fix (backport #100)")], nodes: base, imported: [100]) {
+            check(r.nodes.count == 1, "没有多出根级块")
+            check(r.nodes[0].pr == 100 && r.nodes[0].children.first?.pr == 200,
+                  "backport 挂到了父 PR 下面，而不是落在根级")
         } else {
-            check(false, "imported 落后于树时应该补记")
+            check(false, "backport 应该被导入")
         }
 
-        // 嵌套在描述块里的 PR 也算「已知」
-        var topic = Node(kind: .topic, title: "T")
-        topic.children = [Node(kind: .pr, pr: 300)]
-        if let r = Project.importing([300, 301], nodes: [topic], imported: []) {
-            check(r.nodes.count == 2, "只加了没见过的那个")
-            check(r.nodes.first?.pr == 301, "新的落在根级最前")
-            check(r.imported == [300, 301], "嵌套的 PR 也记进 imported")
+        // 父 PR 不在树里时，退回根级
+        if let r = Project.importing([open(200, "fix (backport #999)")], nodes: base, imported: [100]) {
+            check(r.nodes.first?.pr == 200 && r.nodes.count == 2, "父 PR 不在树里就落根级")
         } else {
-            check(false, "应该导入 301")
+            check(false, "应该被导入")
         }
 
-        // 空项目起步
-        if let r = Project.importing([5, 3, 4], nodes: [], imported: []) {
-            check(r.nodes.map(\.pr) == [5, 4, 3], "空项目导入后按编号倒序排列")
+        // 挂进折叠的父 PR 会自动展开
+        var collapsed = [Node(kind: .pr, pr: 100)]
+        collapsed[0].collapsed = true
+        collapsed[0].children = [Node(kind: .pr, pr: 101)]
+        if let r = Project.importing([open(200, "x (backport #100)")], nodes: collapsed, imported: [100, 101]) {
+            check(r.nodes[0].collapsed == false, "挂进折叠的父 PR 时自动展开，别让新东西藏起来")
         } else {
-            check(false, "空项目应该能导入")
+            check(false, "应该被导入")
         }
+
+        // --- 已关闭的：只收和已跟踪 PR 有关系的 ---
+        check(Project.importing([shut(300, "无关的老 PR")], nodes: base, imported: [100]) == nil,
+              "无关的已关闭 PR 不导入，否则历史上几十个会全倒进来")
+
+        if let r = Project.importing([shut(300, "x (backport #100)")], nodes: base, imported: [100]) {
+            check(r.nodes[0].children.first?.pr == 300,
+                  "已关闭但是已跟踪 PR 的 backport，要收 —— 这正是「backport 被关掉了」的信号")
+        } else {
+            check(false, "相关的已关闭 backport 应该被导入")
+        }
+
+        // 同一批里「新 open 主干 + 它的旧 closed backport」都要收
+        if let r = Project.importing([open(400, "主干"), shut(401, "x (backport #400)")],
+                                     nodes: [], imported: []) {
+            check(r.nodes.count == 1, "主干落根级，backport 挂上去")
+            check(r.nodes[0].pr == 400 && r.nodes[0].children.first?.pr == 401,
+                  "同一批导入时，父 PR 先落地再挂子 PR")
+        } else {
+            check(false, "应该被导入")
+        }
+
+        // 已跟踪的 backport 的父 PR，也要收（反向关系）
+        let tracked = [Node(kind: .pr, pr: 500)]
+        if let r = Project.importing([shut(499, "主干"), shut(500, "x (backport #499)")],
+                                     nodes: tracked, imported: [500]) {
+            check(r.nodes.contains { $0.pr == 499 }, "已跟踪 backport 的父 PR 也要收")
+        } else {
+            check(false, "父 PR 应该被导入")
+        }
+
+        // --- 不变量 ---
+        check(Project.importing([], nodes: base, imported: [100]) == nil, "什么都没查到时不动")
+        check(Project.importing([open(100)], nodes: base, imported: [100]) == nil,
+              "已在树里的不重复导入")
+        check(Project.importing([open(100)], nodes: base, imported: []) != nil,
+              "imported 落后于树时补记")
+        check(Project.importing([open(100, "x (backport #1)")], nodes: [], imported: [100]) == nil,
+              "删掉过的不会被导回来")
     }
 
     static func statusTests() {

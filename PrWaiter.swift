@@ -117,6 +117,15 @@ extension Array where Element == Node {
         return false
     }
 
+    /// 按 PR 编号找节点 id，自动挂 backport 时用来定位父节点
+    func nodeID(forPR n: Int) -> UUID? {
+        for node in self {
+            if node.pr == n { return node.id }
+            if let f = node.children.nodeID(forPR: n) { return f }
+        }
+        return nil
+    }
+
     var allPRNumbers: Set<Int> {
         reduce(into: Set<Int>()) { acc, n in
             if let p = n.pr { acc.insert(p) }
@@ -202,6 +211,13 @@ enum Tree {
     }
 }
 
+/// 从 GitHub 查到的一个 PR，只带导入决策需要的那几项
+struct FoundPR {
+    let number: Int
+    let title: String
+    let isOpen: Bool
+}
+
 struct Project: Codable, Identifiable {
     var id = UUID()
     var name = "新项目"
@@ -228,24 +244,62 @@ struct Project: Codable, Identifiable {
         imported = try c.decodeIfPresent([Int].self, forKey: .imported) ?? []
     }
 
-    /// 把 GitHub 上查到的 open PR 里没见过的那些放进根级顶部。
-    /// 纯函数，返回 nil 表示没有变化。
+    /// 把查到的 PR 里没见过的那些放进树。纯函数，返回 nil 表示没有变化。
+    ///
+    /// 三条规则：
+    /// 1. open 的一律收 —— 手头还在推进的东西
+    /// 2. 已关闭 / 已合并的**只收和已跟踪 PR 有关系的**（是某个已跟踪 PR 的 backport，
+    ///    或者是某个已跟踪 backport 的父 PR）。否则历史上几十个 PR 会全倒进来
+    /// 3. 认得出父 PR 且父 PR 在树里的，直接挂到它下面 —— backport 本来就是
+    ///    「等主干那个先合」的先后关系；认不出的落在根级顶部
     ///
     /// 「没见过」= 既不在 imported 里、也不在树里。后半个条件让手工加过的 PR
     /// 也算数，同时把它们补记进 imported，实现自动迁移。
-    static func importing(_ found: [Int], nodes: [Node], imported: [Int])
+    static func importing(_ found: [FoundPR], nodes: [Node], imported: [Int])
         -> (nodes: [Node], imported: [Int])?
     {
         let known = Set(imported).union(nodes.allPRNumbers)
-        let fresh = found.filter { !known.contains($0) }.sorted()
-        let merged = known.union(fresh).sorted()
-        // 没有新 PR，但树里有 imported 没记的（手工加的），也要补记一次
+        let candidates = found.filter { !known.contains($0.number) }
+
+        // 判断「有关系」时，把这一轮要收的 open PR 也算作已跟踪，
+        // 否则「新 open 主干 + 它的旧 closed backport」同时出现时后者会被漏掉
+        let inTree = nodes.allPRNumbers
+        let openNow = Set(candidates.filter(\.isOpen).map(\.number))
+        let related = inTree.union(openNow)
+        let parentOfTracked = Set(found.compactMap { f -> Int? in
+            related.contains(f.number) ? GhParse.backportParent(from: f.title) : nil
+        })
+
+        let fresh = candidates.filter { c in
+            if c.isOpen { return true }
+            if let p = GhParse.backportParent(from: c.title), related.contains(p) { return true }
+            return parentOfTracked.contains(c.number)
+        }
+
+        let merged = known.union(fresh.map(\.number)).sorted()
         if fresh.isEmpty {
+            // 没有新 PR，但树里有 imported 没记的（手工加的），也要补记一次
             return merged == imported.sorted() ? nil : (nodes, merged)
         }
+
         var out = nodes
-        // 升序逐个插到最前，结果是编号大的在最上面
-        for n in fresh { out.insert(Node(kind: .pr, pr: n), at: 0) }
+        // 先放认不出父 PR 的，升序插到最前 → 编号大的在最上面；
+        // 再挂 backport，这样父 PR 哪怕是同一批新导入的也已经在树里了
+        let (children, roots) = fresh.reduce(into: ([FoundPR](), [FoundPR]())) { acc, f in
+            GhParse.backportParent(from: f.title) == nil ? acc.1.append(f) : acc.0.append(f)
+        }
+        for f in roots.sorted(by: { $0.number < $1.number }) {
+            out.insert(Node(kind: .pr, pr: f.number), at: 0)
+        }
+        for f in children.sorted(by: { $0.number < $1.number }) {
+            let node = Node(kind: .pr, pr: f.number)
+            if let p = GhParse.backportParent(from: f.title), let pid = out.nodeID(forPR: p) {
+                out.attach(node, under: pid)
+                out.update(pid) { $0.collapsed = false }   // 别让新挂上去的藏在折叠里
+            } else {
+                out.insert(node, at: 0)
+            }
+        }
         return (out, merged)
     }
 }
@@ -378,6 +432,18 @@ enum GhParse {
             if !name.isEmpty { return name }
         }
         return nil
+    }
+
+    /// 从 PR 标题里认出「这是谁的 backport」。
+    /// StarRocks 的 mergify 会生成 "…… (backport #77408)"，其他仓库常见
+    /// "backport of #123" / "cherry-pick #123"，都收进来。
+    /// 实测 51 个 PR 里 40 个能解析出父 PR，解析不出的正是主干 PR 本身。
+    static func backportParent(from title: String) -> Int? {
+        let pattern = #"(?i)(?:backport|cherry[- ]?pick)(?:ed)?(?:\s+(?:of|from))?[^#\d]{0,12}#(\d+)"#
+        guard let m = title.range(of: pattern, options: .regularExpression) else { return nil }
+        // 取匹配段里最后一串数字，也就是 # 后面那个编号
+        guard let numRange = title[m].range(of: #"\d+$"#, options: .regularExpression) else { return nil }
+        return Int(title[m][numRange])
     }
 
     /// 按优先级排出候选路径：自定义 > 常见安装位置 > PATH 里的每一段
@@ -724,7 +790,7 @@ final class Model: ObservableObject {
 
     /// 把当前 gh 账号在该仓库下所有 open 的 PR 导进来（只导没见过的）
     func importMyOpenPRs(into pid: UUID, repo: String) async {
-        guard let found = try? await Self.fetchMyOpenPRs(repo: repo) else { return }
+        guard let found = try? await Self.fetchMyPRs(repo: repo) else { return }
         guard let i = store.projects.firstIndex(where: { $0.id == pid }) else { return }
         guard let r = Project.importing(found,
                                         nodes: store.projects[i].nodes,
@@ -784,7 +850,7 @@ final class Model: ObservableObject {
 
     /// 查当前 gh 账号在该仓库下所有 open 的 PR 编号。
     /// 用 `gh pr list` 而不是自己拼 GraphQL：一条命令的事，少一份要维护的查询。
-    nonisolated static func fetchMyOpenPRs(repo: String) async throws -> [Int] {
+    nonisolated static func fetchMyPRs(repo: String) async throws -> [FoundPR] {
         guard let gh = ghPath() else { throw AppError("找不到 GitHub CLI（gh）") }
         guard repo.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil else {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
@@ -792,31 +858,36 @@ final class Model: ObservableObject {
         // 作者是我、或者指派给我，两者取并集。
         // 机器人自动建的 backport 常常作者是 bot、只把你设成 assignee，
         // 光看 author 会漏掉。gh 的两个过滤条件是 AND，所以只能查两次再合并。
-        async let mine = listOpenPRs(gh, repo: repo, filter: ["--author", "@me"])
-        async let assigned = listOpenPRs(gh, repo: repo, filter: ["--assignee", "@me"])
+        async let mine = listPRs(gh, repo: repo, filter: ["--author", "@me"])
+        async let assigned = listPRs(gh, repo: repo, filter: ["--assignee", "@me"])
 
-        var numbers = Set<Int>()
-        var failures: [Error] = []
+        var byNumber: [Int: FoundPR] = [:]
+        var failures = 0
         for r in [try? await mine, try? await assigned] {
-            if let r { numbers.formUnion(r) } else { failures.append(AppError("查询失败")) }
+            if let r { for p in r { byNumber[p.number] = p } } else { failures += 1 }
         }
         // 一条挂了另一条还能用，就用能用的那份；两条都挂才算失败
-        if failures.count == 2 {
-            throw AppError("gh pr list 调用失败")
-        }
-        return numbers.sorted()
+        if failures == 2 { throw AppError("gh pr list 调用失败") }
+        return byNumber.values.sorted { $0.number < $1.number }
     }
 
-    private nonisolated static func listOpenPRs(
+    private nonisolated static func listPRs(
         _ gh: String, repo: String, filter: [String]
-    ) async throws -> [Int] {
-        let out = try await run(gh, ["pr", "list", "-R", repo, "--state", "open",
-                                     "--limit", "200", "--json", "number"] + filter)
+    ) async throws -> [FoundPR] {
+        // --state all：已关闭的也要，好把「主干合了但 backport 被关掉」这种情况显出来。
+        // 收不收由 Project.importing 决定 —— 只收和已跟踪 PR 有关系的那些。
+        let out = try await run(gh, ["pr", "list", "-R", repo, "--state", "all",
+                                     "--limit", "200", "--json", "number,title,state"] + filter)
         guard let arr = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [[String: Any]]
         else {
             throw AppError(out.stderr.isEmpty ? "gh pr list 调用失败" : out.stderr)
         }
-        return arr.compactMap { $0["number"] as? Int }
+        return arr.compactMap { d in
+            guard let n = d["number"] as? Int else { return nil }
+            return FoundPR(number: n,
+                           title: d["title"] as? String ?? "",
+                           isOpen: (d["state"] as? String) == "OPEN")
+        }
     }
 
     /// 一次 GraphQL 请求拉完整个项目的 PR 状态
