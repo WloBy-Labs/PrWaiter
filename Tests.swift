@@ -25,6 +25,7 @@ struct Tests {
         migrationTests()
         codableTests()
         ghParseTests()
+        versionTests()
 
         print(failed == 0 ? "\n全部通过" : "\n\(failed) 项失败")
         exit(failed == 0 ? 0 : 1)
@@ -568,6 +569,32 @@ struct Tests {
         let c4 = GhParse.candidates(custom: "/opt/homebrew/bin/gh", pathEnv: "", home: "/Users/x")
         check(c4.filter { $0 == "/opt/homebrew/bin/gh" }.count == 1,
               "自定义路径与内置路径相同时不重复")
+    }
+
+    static func versionTests() {
+        print("版本号比较:")
+        check(Version.isNewer("0.9.0", than: "0.8.1"), "0.9.0 比 0.8.1 新")
+        check(Version.isNewer("0.8.2", than: "0.8.1"), "补丁位递增")
+        check(Version.isNewer("1.0.0", than: "0.9.9"), "跨大版本")
+
+        // 字符串比较会在这里翻车："0.10.0" < "0.9.0"
+        check(Version.isNewer("0.10.0", than: "0.9.0"), "0.10.0 比 0.9.0 新（字符串比较会判错）")
+        check(Version.isNewer("1.10.0", than: "1.9.20"), "次版本按数字比，不按字符串")
+        check(!Version.isNewer("0.9.0", than: "0.10.0"), "反过来不成立")
+
+        check(!Version.isNewer("0.8.1", than: "0.8.1"), "同版本不算新")
+        check(!Version.isNewer("0.8.0", than: "0.8.1"), "旧版本不算新")
+
+        // tag 带 v 前缀
+        check(Version.isNewer("v0.9.0", than: "0.8.1"), "带 v 前缀也能比")
+        check(!Version.isNewer("v0.8.1", than: "0.8.1"), "带 v 前缀的同版本不算新")
+
+        // 段数不同时短的补 0
+        check(Version.compare("1.0", "1.0.0") == .orderedSame, "1.0 和 1.0.0 相等")
+        check(Version.isNewer("1.0.1", than: "1.0"), "1.0.1 比 1.0 新")
+
+        check(Version.parts("v0.9.0") == [0, 9, 0], "解析出各段数字")
+        check(Version.parts("1.2.3-beta") == [1, 2, 3], "带后缀时只取数字部分")
     }
 }
 
