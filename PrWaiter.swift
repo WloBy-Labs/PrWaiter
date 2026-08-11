@@ -461,17 +461,20 @@ enum Prefs {
     static let autoImport = "autoImport"            // 自动把我的 open PR 导进来
     static let autoCheckUpdate = "autoCheckUpdate"  // 启动时检查更新
     static let autoInstallUpdate = "autoInstallUpdate"  // 查到就自动装（默认关）
+    static let tutorialDone = "tutorialDone"        // 首次引导走完没
 
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
             refreshInterval: 60, autoImport: true,
             autoCheckUpdate: true, autoInstallUpdate: false,
+            tutorialDone: false,
         ])
     }
 
     static var autoImportOn: Bool { UserDefaults.standard.bool(forKey: autoImport) }
     static var autoCheckUpdateOn: Bool { UserDefaults.standard.bool(forKey: autoCheckUpdate) }
     static var autoInstallUpdateOn: Bool { UserDefaults.standard.bool(forKey: autoInstallUpdate) }
+    static var tutorialDoneFlag: Bool { UserDefaults.standard.bool(forKey: tutorialDone) }
 
     static var customGhPath: String {
         UserDefaults.standard.string(forKey: ghPath) ?? ""
@@ -660,6 +663,214 @@ enum PRStatus: CaseIterable {
     var isSettled: Bool { self == .merged || self == .closed }
 }
 
+// MARK: - 上手导览（聚光灯式）
+
+/// 要高亮的界面元素。用 preference 上报各自的位置，遮罩再据此挖洞。
+enum TourTarget: String {
+    case projectTabs, editButton, gearButton, refreshButton
+    case topicRow, collapseZone, statusBadges, dragGrip
+}
+
+struct TourAnchors: PreferenceKey {
+    static let defaultValue: [TourTarget: Anchor<CGRect>] = [:]
+    static func reduce(value: inout [TourTarget: Anchor<CGRect>],
+                       nextValue: () -> [TourTarget: Anchor<CGRect>]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// 铺满宿主视图的透明层，只负责上报自己的位置
+private struct TourAnchorReporter: View {
+    let target: TourTarget
+    var body: some View {
+        Color.clear.anchorPreference(key: TourAnchors.self, value: .bounds) { [target: $0] }
+    }
+}
+
+extension View {
+    /// 挂在要被导览指到的控件上。
+    ///
+    /// 用 overlay 里的透明层上报，而不是把 anchorPreference 直接挂在自己身上：
+    /// preference 挂在父视图上会**盖掉整棵子树**的同键上报 —— 描述块一上报，
+    /// 它内部折叠区的锚点就没了，那一步只能退化成居中的对话框。
+    /// 放进 overlay 后两者是兄弟，走 reduce 合并，各报各的。
+    func tourTarget(_ t: TourTarget) -> some View {
+        overlay(TourAnchorReporter(target: t).allowsHitTesting(false))
+    }
+}
+
+/// 只在 on 为真时上报锚点
+struct TourTargetIf: ViewModifier {
+    let on: Bool
+    let target: TourTarget
+    func body(content: Content) -> some View {
+        if on { content.tourTarget(target) } else { content }
+    }
+}
+
+/// 导览期间铺在看板上的样板数据。
+///
+/// 首次启动时用户一条数据都没有 —— 指着空看板讲「描述块」「状态颜色」，
+/// 洞会挖在空气上，气泡退化成一个干巴巴的对话框。所以导览自带一份假数据，
+/// 保证每一步都有真东西可指。编号用 900+，跟真 PR 一眼能分开。
+enum TourDemo {
+    static let projects = ["示例仓库", "另一个仓库"]
+
+    /// 两个 backport 挂在主干 PR 下面 —— 这正好是「缩进 = 先后关系」那一步要指的东西
+    static let nodes: [Node] = {
+        var trunk = Node(kind: .pr, pr: 901)
+        trunk.children = [Node(kind: .pr, pr: 902), Node(kind: .pr, pr: 903)]
+        var topic = Node(kind: .topic, title: "spill 相关改动", note: "主干先合，backport 跟着走")
+        topic.children = [trunk]
+        return [topic]
+    }()
+
+    /// 三行分别落在「可以合了」「等上游」「CI 挂了」上，颜色那一步才讲得清。
+    /// 902 自身条件其实齐了，是被 901 挡着 —— 这就是 blocked 那一档的意思。
+    static let live: [Int: LivePR] = [
+        901: LivePR(title: "[Enhancement] Enable auto-mode spill for the nestloop join",
+                    state: "OPEN", author: "you", base: "main",
+                    review: "APPROVED", ci: "SUCCESS"),
+        902: LivePR(title: "[BugFix] Derive the reserve limit from the memory limit (backport #901)",
+                    state: "OPEN", author: "mergify", base: "branch-3.5",
+                    review: "APPROVED", ci: "SUCCESS"),
+        903: LivePR(title: "[BugFix] Derive the reserve limit from the memory limit (backport #901)",
+                    state: "OPEN", author: "mergify", base: "branch-4.0",
+                    review: "REVIEW_REQUIRED", ci: "FAILURE"),
+    ]
+}
+
+struct TourStep {
+    let target: TourTarget?     // nil = 没有具体目标，气泡居中显示
+    /// 这一步要指的控件只在编辑态才出现（拖动手柄），导览得先把它显出来
+    var needsEditing = false
+    let title: String
+    let body: String
+    /// 这一步要求主界面处于哪一页；nil 表示不改
+    var page: ContentView.Page?
+
+    /// 每一步都指着一个真实控件 —— 这就是导览该干的事，
+    /// 不要没有目标的纯说明页，那种看着只是个对话框
+    static let all: [TourStep] = [
+        TourStep(target: .projectTabs,
+                 title: "项目标签",
+                 body: "一个标签对应一个仓库，切换后只看那个仓库的 PR。"
+                     + "编辑模式下还能拖动标签调整顺序。"),
+        TourStep(target: .topicRow,
+                 title: "描述块：把相关 PR 收在一起",
+                 body: "写上「这是在修什么」，相关 PR 归到它下面。\n\n"
+                     + "**缩进就是先后关系** —— 子块要等父块先合并。"
+                     + "这是整个 App 最核心的一条，其余都是细节。"),
+        TourStep(target: .statusBadges,
+                 title: "状态：颜色按「欠在谁身上」分",
+                 body: "绿=可以合了、红=欠在你身上（CI 挂了 / 要改）、"
+                     + "橙=等机器、蓝=等人 review、靛=等上游那个 PR、灰=已终结。\n\n"
+                     + "完整对照表在设置的「状态说明」里。"),
+        TourStep(target: .collapseZone,
+                 title: "折叠区",
+                 body: "块最左边这一整条都能点，收起 / 展开。\n\n"
+                     + "折叠**不影响统计** —— 收起来的 PR 照样算在描述块右侧的数量里。"),
+        TourStep(target: .editButton,
+                 title: "编辑 / 冻结",
+                 body: "默认冻结，只读，避免误拖误删。点它才会出现拖动手柄、增删按钮和输入框。\n\n"
+                     + "**拖不动多半是忘了先点这里。**"),
+        TourStep(target: .dragGrip,
+                 needsEditing: true,
+                 title: "拖拽：落点决定意思",
+                 body: "编辑模式下拖这个手柄：\n"
+                     + "· 落在**块身上** = 成为它的子块（归类，或表示「等它先合」）\n"
+                     + "· 落在**块之间** = 排到那个位置\n"
+                     + "· 落在**底部虚线区** = 回到根级"),
+        TourStep(target: .refreshButton,
+                 title: "刷新会自动导入",
+                 body: "每次刷新先把**作者是你、或指派给你**的 open PR 导进来，"
+                     + "backport 自动挂到主干 PR 下面，然后再拉取全部状态。\n\n"
+                     + "不用手工填编号。"),
+        TourStep(target: .gearButton,
+                 title: "设置",
+                 body: "gh 的安装与登录、刷新间隔、状态说明、检查更新都在这里。\n\n"
+                     + "想重看这份导览，也在设置的「关于」里。"),
+    ]
+}
+
+/// 聚光灯遮罩：四周压暗，目标位置挖个洞并描边，旁边浮一个说明气泡
+struct TourOverlay: View {
+    @EnvironmentObject var m: Model
+    let index: Int
+    let rect: CGRect?          // 目标在窗口里的位置，nil 表示居中显示
+    let canvas: CGSize
+
+    private var step: TourStep { TourStep.all[index] }
+    private var hole: CGRect? { rect?.insetBy(dx: -6, dy: -6) }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            // 压暗 + 挖洞。用 even-odd 填充规则做出真正的空洞，
+            // 而不是画个亮框——空洞才能让下面的内容原色透出来
+            Path { p in
+                p.addRect(CGRect(origin: .zero, size: canvas))
+                if let h = hole {
+                    p.addRoundedRect(in: h, cornerSize: CGSize(width: 8, height: 8))
+                }
+            }
+            .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
+
+            if let h = hole {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.accentColor, lineWidth: 2)
+                    .frame(width: h.width, height: h.height)
+                    .offset(x: h.minX, y: h.minY)
+            }
+
+            bubble
+                .frame(width: 380)
+                .offset(x: bubbleOrigin.x, y: bubbleOrigin.y)
+        }
+        .frame(width: canvas.width, height: canvas.height)
+        // 吃掉所有点击：导览期间只能用气泡上的按钮，免得点乱了
+        .contentShape(Rectangle())
+        .onTapGesture { }
+    }
+
+    var bubble: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(step.title).font(.headline)
+                Spacer()
+                Text(verbatim: "\(index + 1) / \(TourStep.all.count)")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Text(.init(step.body)).font(.callout).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("跳过") { m.finishTour() }.buttonStyle(.link)
+                Spacer()
+                if index > 0 {
+                    Button("上一步") { m.backTour() }
+                }
+                Button(index == TourStep.all.count - 1 ? "开始使用" : "下一步") { m.advanceTour() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .windowBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.accentColor.opacity(0.45)))
+        .shadow(radius: 12)
+    }
+
+    /// 气泡放在洞的下方；下方放不下就放上方。左右夹在画布内，别跑出去
+    var bubbleOrigin: CGPoint {
+        let w: CGFloat = 380, h: CGFloat = 190, pad: CGFloat = 14
+        guard let hRect = hole else {
+            return CGPoint(x: (canvas.width - w) / 2, y: (canvas.height - h) / 2)
+        }
+        var y = hRect.maxY + pad
+        if y + h > canvas.height { y = max(pad, hRect.minY - h - pad) }
+        let x = min(max(pad, hRect.midX - w / 2), canvas.width - w - pad)
+        return CGPoint(x: x, y: y)
+    }
+}
+
 // MARK: - 版本与自动更新
 
 enum Version {
@@ -730,6 +941,9 @@ final class Model: ObservableObject {
     @Published var installLog: [String] = []
     @Published var installing = false
     // 自动更新
+    @Published var tourIndex: Int?           // nil 表示不在导览中
+    /// 导览要求主界面切到哪一页（比如讲设置时）
+    @Published var page: ContentView.Page?
     @Published var latest: ReleaseInfo?      // 查到的最新发布
     @Published var updateState = UpdateState.idle
     @Published var updateLog: [String] = []
@@ -764,6 +978,8 @@ final class Model: ObservableObject {
             }
         }
         if store.selected == nil { store.selected = store.projects.first?.id }
+        // 没走过导览就开一次。看板空不空都能走 —— 导览期间铺的是 TourDemo 的样板数据
+        if !Prefs.tutorialDoneFlag { tourIndex = 0 }
         Task { await self.refresh() }
         Task { await self.detectToolchain() }
         if Prefs.autoCheckUpdateOn {
@@ -906,6 +1122,33 @@ final class Model: ObservableObject {
               let moved = Tree.move(dragged, toRootIndex: index, in: store.projects[i].nodes) else { return }
         store.projects[i].nodes = moved
         save()
+    }
+
+    // MARK: 上手导览
+
+    func startTour() {
+        tourIndex = 0
+        page = nil          // 让主界面回到看板
+    }
+
+    func advanceTour() {
+        guard let i = tourIndex else { return }
+        if i + 1 < TourStep.all.count { tourIndex = i + 1 } else { finishTour() }
+    }
+
+    func backTour() {
+        guard let i = tourIndex, i > 0 else { return }
+        tourIndex = i - 1
+    }
+
+    func finishTour() {
+        tourIndex = nil
+        UserDefaults.standard.set(true, forKey: Prefs.tutorialDone)
+    }
+
+    /// 当前这一步要不要把编辑态的控件显出来（只影响显示，不动用户的编辑开关）
+    var tourEditing: Bool {
+        tourIndex.map { TourStep.all[$0].needsEditing } ?? false
     }
 
     // MARK: 更新
@@ -1332,7 +1575,12 @@ final class Model: ObservableObject {
     // MARK: 状态推导
 
     func status(pr: Int, blocked: Bool) -> PRStatus {
-        Self.classify(live[pr], blocked: blocked)
+        Self.classify(livePR(pr), blocked: blocked)
+    }
+
+    /// 导览期间读样板数据，其余时候读实时拉到的
+    func livePR(_ pr: Int) -> LivePR? {
+        tourIndex == nil ? live[pr] : TourDemo.live[pr]
     }
 
     /// 纯函数，方便单独测；分类是互斥的，命中一个就返回
@@ -1358,7 +1606,8 @@ final class Model: ObservableObject {
 extension Model {
     /// 整棵树的所有行，含被折叠藏起来的
     var allRows: [Row] {
-        Tree.flatten(project?.nodes ?? []) { live[$0]?.state == "MERGED" }
+        let nodes = tourIndex == nil ? (project?.nodes ?? []) : TourDemo.nodes
+        return Tree.flatten(nodes) { livePR($0)?.state == "MERGED" }
     }
 
     /// 实际渲染的行
@@ -1416,7 +1665,12 @@ struct ContentView: View {
     @EnvironmentObject var m: Model
     @State private var newPR = ""
     @State private var rootTargeted = false
-    @State private var page = Page.board
+    @State private var localPage = Page.board
+    /// 导览要求切页时优先听它的
+    var page: Page {
+        get { m.page ?? localPage }
+        nonmutating set { localPage = newValue; m.page = nil }
+    }
 
     /// 设置不再弹窗，而是主区域里换一页 —— 看板和设置是同一个界面的两个页面
     enum Page { case board, settings }
@@ -1440,6 +1694,19 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.15), value: page)
         // 窗口标题条只留应用名和版本，不挂任何按钮 —— 保持干净
         .navigationTitle(Text(verbatim: "PrWaiter v\(Self.appVersion)"))
+        .overlayPreferenceValue(TourAnchors.self) { anchors in
+            GeometryReader { proxy in
+                if let i = m.tourIndex, i < TourStep.all.count {
+                    let t = TourStep.all[i].target
+                    TourOverlay(
+                        index: i,
+                        rect: t.flatMap { anchors[$0] }.map { proxy[$0] },
+                        canvas: proxy.size
+                    )
+                    .environmentObject(m)
+                }
+            }
+        }
     }
 
     var boardPage: some View {
@@ -1496,6 +1763,7 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .disabled(m.loading)
             .help("立即刷新")
+            .tourTarget(.refreshButton)
 
             Button(m.editing ? "完成" : "编辑") {
                 m.editing.toggle()
@@ -1504,6 +1772,7 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .tint(m.editing ? .green : .accentColor)
             .help(m.editing ? "退出编辑，冻结布局" : "进入编辑，可拖动、增删")
+            .tourTarget(.editButton)
 
             Button { page = .settings } label: {
                 Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
@@ -1512,6 +1781,7 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .help(m.gh.ready ? "设置" : "gh 还没配好，点这里")
+            .tourTarget(.gearButton)
         }
         .fixedSize()   // 按钮区不被标签挤压
     }
@@ -1521,6 +1791,12 @@ struct ContentView: View {
     var projectTabs: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
+                if m.tourIndex != nil, m.store.projects.isEmpty {
+                    // 首次启动一个项目都没有，导览得有东西可指
+                    ForEach(Array(TourDemo.projects.enumerated()), id: \.offset) { i, name in
+                        demoTab(name, active: i == 0)
+                    }
+                }
                 ForEach(Array(m.store.projects.enumerated()), id: \.element.id) { i, p in
                     if m.editing { TabGap(index: i) }
                     tab(p)
@@ -1541,6 +1817,23 @@ struct ContentView: View {
             .padding(.vertical, 2)   // 内外边距交给控制条统一控制
         }
         .frame(maxWidth: .infinity, alignment: .leading)   // 标签占满剩余宽度，按钮靠右
+        .tourTarget(.projectTabs)
+    }
+
+    /// 导览用的假标签：只有样子，点不动
+    func demoTab(_ name: String, active: Bool) -> some View {
+        Text(name)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(active ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(active ? Color.accentColor : .clear, lineWidth: 1)
+            )
+            .foregroundColor(active ? .accentColor : .primary)
     }
 
     /// 用普通视图 + 点击手势而不是 Button：Button 会吞掉拖拽手势，
@@ -1594,7 +1887,7 @@ struct ContentView: View {
 
     @ViewBuilder
     var content: some View {
-        if m.project == nil {
+        if m.project == nil, m.tourIndex == nil {
             emptyProjects
         } else {
             ScrollView {
@@ -1650,12 +1943,12 @@ struct ContentView: View {
                         if m.editing {
                             RowGap(index: row.index, parent: row.parent, depth: row.depth)
                         }
-                        NodeRow(row: row)
+                        NodeRow(row: row, tourSample: isTourSample(row))
                     }
                     if m.editing, !(m.project?.nodes ?? []).isEmpty {
                         RowGap(index: m.project?.nodes.count ?? 0)   // 根级末尾那条缝
                     }
-                    if (m.project?.nodes ?? []).isEmpty {
+                    if m.rows.isEmpty {
                         Text(m.editing
                              ? "空的。用上面的「+ 描述块」建一个分组，或直接添加 PR。"
                              : "还没有内容，点右上角「编辑」开始添加。")
@@ -1668,6 +1961,12 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+    }
+
+    /// 导览要指的样板行：各类型的第一行
+    func isTourSample(_ row: Row) -> Bool {
+        guard m.tourIndex != nil else { return false }
+        return m.rows.first { $0.node.kind == row.node.kind }?.id == row.id
     }
 
     var emptyProjects: some View {
@@ -2027,6 +2326,9 @@ struct SettingsView: View {
     var aboutSection: some View {
         Section("关于") {
             LabeledContent("版本", value: ContentView.appVersion)
+            LabeledContent("上手导览") {
+                Button("重新查看") { m.startTour() }
+            }
             LabeledContent("数据文件") {
                 HStack {
                     Text(verbatim: Model.dataURL.path)
@@ -2196,6 +2498,8 @@ extension Row {
 struct NodeRow: View {
     @EnvironmentObject var m: Model
     let row: Row
+    /// 导览要指的样板行。多行都上报的话锚点会互相覆盖，所以只让第一个报
+    var tourSample = false
     @State private var targeted = false
     @State private var draft = ""
     @State private var confirmDelete = false
@@ -2258,6 +2562,7 @@ struct NodeRow: View {
         .disabled(!hasKids)
         .onHover { hovering = $0 }
         .help(row.node.collapsed ? "展开（\(row.descendants) 个块）" : "折叠")
+        .modifier(TourTargetIf(on: tourSample && row.node.kind == .topic, target: .collapseZone))
     }
 
     static let zoneWidth: CGFloat = 32
@@ -2312,19 +2617,20 @@ struct NodeRow: View {
         }
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor.opacity(0.25)))
+        .modifier(TourTargetIf(on: tourSample && row.node.kind == .topic, target: .topicRow))
     }
 
     // MARK: PR 块
 
     var prBody: some View {
         let num = row.node.pr ?? 0
-        let lv = m.live[num]
+        let lv = m.livePR(num)
         let st = m.status(pr: num, blocked: row.blocked)
         return HStack(spacing: 0) {
             collapseZone
             VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 8) {
-                if m.editing { grip }
+                if m.editing || (m.tourEditing && tourSample) { grip }
                 // 一律 verbatim：PR 编号是标识符，不能被本地化成 "#77,255"
                 if let lv, let u = URL(string: lv.url), !m.editing {
                     Link(destination: u) { Text(verbatim: "#\(num)") }
@@ -2338,8 +2644,12 @@ struct NodeRow: View {
                     .foregroundColor(st == .merged ? .secondary : .primary)
                 Spacer()
                 collapsedBadge
-                badges(lv)
-                Text(st.label).font(.caption).foregroundColor(st.color)
+                // 徽标和状态词一起被导览指到 —— 那一步讲的是整片状态显示
+                HStack(spacing: 8) {
+                    badges(lv)
+                    Text(st.label).font(.caption).foregroundColor(st.color)
+                }
+                .modifier(TourTargetIf(on: tourSample && row.node.kind == .pr, target: .statusBadges))
                 if m.editing { deleteButton }
             }
             HStack(spacing: 6) {
@@ -2375,6 +2685,7 @@ struct NodeRow: View {
         Image(systemName: "line.3.horizontal")
             .foregroundColor(.secondary)
             .help("拖动以重新归类")
+            .modifier(TourTargetIf(on: tourSample && row.node.kind == .pr, target: .dragGrip))
     }
 
     /// 目标分支。一组 backport 的标题一字不差，唯一的区别就是打到哪个分支上 ——
