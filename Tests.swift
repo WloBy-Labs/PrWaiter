@@ -19,6 +19,7 @@ struct Tests {
         collapseTests()
         guideTests()
         reorderTests()
+        subLevelReorderTests()
         autoImportTests()
         reparentTests()
         projectReorderTests()
@@ -271,6 +272,77 @@ struct Tests {
         } else {
             check(false, "越界应该被夹住而不是失败")
         }
+    }
+
+    static func subLevelReorderTests() {
+        print("子层重排:")
+
+        // topic 下面挂三个 PR：p1, p2, p3
+        var p1 = Node(kind: .pr, pr: 1), p2 = Node(kind: .pr, pr: 2), p3 = Node(kind: .pr, pr: 3)
+        p1.note = "one"; p2.note = "two"; p3.note = "three"
+        var topic = Node(kind: .topic, title: "组")
+        topic.children = [p1, p2, p3]
+        let nodes = [topic, Node(kind: .pr, pr: 9)]
+        let kids = { (ns: [Node]) in ns.find(topic.id)?.children.map(\.pr) ?? [] }
+
+        // 同层往前挪
+        if let r = Tree.move(p3.id, toIndex: 0, under: topic.id, in: nodes) {
+            check(kids(r) == [3, 1, 2], "子块可以在同层往前挪")
+            check(r.count == 2, "根级数量没变")
+        } else {
+            check(false, "子层应该能重排")
+        }
+
+        // 同层往后挪：下标要减掉自己占的那一格
+        if let r = Tree.move(p1.id, toIndex: 2, under: topic.id, in: nodes) {
+            check(kids(r) == [2, 1, 3], "往后挪时下标减掉自己占的那一格")
+        } else {
+            check(false, "子层应该能往后挪")
+        }
+        if let r = Tree.move(p1.id, toIndex: 3, under: topic.id, in: nodes) {
+            check(kids(r) == [2, 3, 1], "挪到本层末尾")
+        } else {
+            check(false, "应该能挪到本层末尾")
+        }
+
+        // 没挪动的不写盘
+        check(Tree.move(p2.id, toIndex: 1, under: topic.id, in: nodes) == nil, "挪到自己当前位置返回 nil")
+        check(Tree.move(p2.id, toIndex: 2, under: topic.id, in: nodes) == nil,
+              "挪到自己后面紧邻的位置等于没动")
+        check(Tree.move(p3.id, toIndex: 99, under: topic.id, in: nodes) == nil, "末位挪到末位返回 nil")
+
+        // 从别处拖进某一层的指定位置 = 换爹 + 定位
+        if let r = Tree.move(nodes[1].id, toIndex: 1, under: topic.id, in: nodes) {
+            check(kids(r) == [1, 9, 2, 3], "根级块拖进子层的指定位置")
+            check(r.count == 1, "根级少了一个")
+        } else {
+            check(false, "应该能拖进子层")
+        }
+
+        // 拖到自己的子树里 = 成环，拒绝
+        var outer = Node(kind: .pr, pr: 10)
+        outer.children = [Node(kind: .pr, pr: 11)]
+        let inner = outer.children[0].id
+        check(Tree.move(outer.id, toIndex: 0, under: inner, in: [outer]) == nil, "不能插进自己的子树")
+        check(Tree.move(topic.id, toIndex: 0, under: nodes[1].id, in: nodes) == nil,
+              "描述块不能插到别人下面")
+        check(Tree.move(p1.id, toIndex: 0, under: UUID(), in: nodes) == nil, "父节点不存在返回 nil")
+
+        // 插进折叠起来的块，要把它展开，不然看着像拖没了
+        var folded = topic
+        folded.collapsed = true
+        if let r = Tree.move(nodes[1].id, toIndex: 0, under: folded.id, in: [folded, nodes[1]]) {
+            check(r.find(folded.id)?.collapsed == false, "插进折叠的块会展开它")
+        } else {
+            check(false, "应该能插进折叠的块")
+        }
+
+        // 铺平后每行都知道自己归谁管、排第几 —— 投放缝靠这两个值定位
+        let rows = Tree.flatten(nodes) { _ in false }
+        check(rows.first { $0.node.pr == 2 }?.parent == topic.id, "子行知道自己的父节点")
+        check(rows.first { $0.node.pr == 2 }?.index == 1, "子行知道自己在同层排第几")
+        check(rows.first { $0.node.pr == 9 }?.parent == nil, "根级行没有父节点")
+        check(rows.first { $0.node.pr == 9 }?.index == 1, "根级行的下标是根级下标")
     }
 
     static func projectReorderTests() {
