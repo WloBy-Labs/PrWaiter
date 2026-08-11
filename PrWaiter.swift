@@ -501,15 +501,17 @@ enum PRStatus: CaseIterable {
         }
     }
 
+    /// 配色按「这件事欠在谁身上」分，灰色只留给已经终结的 ——
+    /// 「等 review」是活的、可以去催的，染成灰色等于说它没戏了
     var color: Color {
         switch self {
-        case .ready: return .green
-        case .ciFailed, .changesRequested: return .red
-        case .ciRunning: return .orange
-        case .needsReview, .blocked, .draft: return .gray
-        case .merged: return .purple
-        case .closed: return .pink
-        case .unknown: return .gray
+        case .ready: return .green                        // 可以动了
+        case .ciFailed, .changesRequested: return .red    // 欠在你身上，且是坏消息
+        case .ciRunning: return .orange                   // 欠在机器身上
+        case .needsReview: return .blue                   // 欠在别人身上，能去催
+        case .blocked: return .indigo                     // 欠在上游那个 PR 身上
+        case .merged: return .purple                      // 成了（沿用 GitHub 的紫）
+        case .closed, .draft, .unknown: return .secondary // 已终结 / 还没发出去 / 不知道
         }
     }
 
@@ -550,8 +552,13 @@ enum PRStatus: CaseIterable {
         .needsReview, .blocked, .draft, .merged, .closed, .unknown,
     ]
 
-    /// 已经尘埃落定、不需要再盯的
+    /// 已经尘埃落定、不需要再盯的。配色本身已经把它们压成灰或紫，
+    /// 所以显示时不用再额外压暗一遍。
     var isSettled: Bool { self == .merged || self == .closed }
+}
+
+extension Optional where Wrapped == String {
+    var isNilOrEmpty: Bool { self?.isEmpty ?? true }
 }
 
 struct AppError: LocalizedError {
@@ -1581,7 +1588,7 @@ struct SettingsView: View {
             ForEach(PRStatus.summaryOrder.filter { $0 != .unknown }, id: \.self) { st in
                 HStack(spacing: 10) {
                     Image(systemName: st.symbol)
-                        .foregroundColor(st.isSettled ? .secondary : st.color)
+                        .foregroundColor(st.color)
                         .frame(width: 18)
                     Text(st.label)
                         .frame(width: 82, alignment: .leading)
@@ -1722,10 +1729,10 @@ struct StatusChips: View {
                     Text(verbatim: "\(n)").font(.caption2.monospacedDigit())
                 }
                 // 已完成的压暗，别和还要盯的抢注意力
-                .foregroundColor(st.isSettled ? .secondary : st.color)
+                .foregroundColor(st.color)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
-                .background(Capsule().fill((st.isSettled ? Color.secondary : st.color).opacity(0.13)))
+                .background(Capsule().fill(st.color.opacity(0.13)))
                 .help("\(st.label) \(n) 个")
             }
         }
@@ -1939,9 +1946,6 @@ struct NodeRow: View {
                 if m.editing { deleteButton }
             }
             HStack(spacing: 6) {
-                if let lv, !lv.author.isEmpty {
-                    Text("@\(lv.author)").foregroundColor(.secondary)
-                }
                 if m.editing {
                     TextField("备注…", text: $draft)
                         .textFieldStyle(.plain)
@@ -1950,6 +1954,8 @@ struct NodeRow: View {
                 } else if !row.node.note.isEmpty {
                     Text(row.node.note).foregroundColor(.secondary)
                 }
+                Spacer(minLength: 8)
+                author(lv)
             }
             .font(.caption)
             }
@@ -1971,6 +1977,23 @@ struct NodeRow: View {
         Image(systemName: "line.3.horizontal")
             .foregroundColor(.secondary)
             .help("拖动以重新归类")
+    }
+
+    /// 创建人，靠右和上面一行的状态排成一列。
+    /// 不是自己建的会加重显示 —— 机器人代建的 backport 和自己开的 PR，
+    /// 处理方式不一样，值得一眼分得出来。
+    @ViewBuilder
+    func author(_ lv: LivePR?) -> some View {
+        if let lv, !lv.author.isEmpty {
+            let isMe = !m.gh.account.isNilOrEmpty && lv.author == m.gh.account
+            HStack(spacing: 3) {
+                Image(systemName: isMe ? "person" : "person.fill.badge.plus")
+                    .font(.system(size: 9))
+                Text(verbatim: "@\(lv.author)")
+            }
+            .foregroundColor(isMe ? .secondary : .primary)
+            .help(isMe ? "你创建的" : "由 \(lv.author) 创建，不是你")
+        }
     }
 
     var deleteButton: some View {
