@@ -729,11 +729,14 @@ enum TourDemo {
     /// 902 自身条件其实齐了，是被 901 挡着 —— 这就是 blocked 那一档的意思。
     static let live: [Int: LivePR] = [
         901: LivePR(title: "[Enhancement] Enable auto-mode spill for the nestloop join",
-                    state: "OPEN", author: "you", review: "APPROVED", ci: "SUCCESS"),
+                    state: "OPEN", author: "you", base: "main",
+                    review: "APPROVED", ci: "SUCCESS"),
         902: LivePR(title: "[BugFix] Derive the reserve limit from the memory limit (backport #901)",
-                    state: "OPEN", author: "mergify", review: "APPROVED", ci: "SUCCESS"),
+                    state: "OPEN", author: "mergify", base: "branch-3.5",
+                    review: "APPROVED", ci: "SUCCESS"),
         903: LivePR(title: "[BugFix] Derive the reserve limit from the memory limit (backport #901)",
-                    state: "OPEN", author: "mergify", review: "REVIEW_REQUIRED", ci: "FAILURE"),
+                    state: "OPEN", author: "mergify", base: "branch-4.0",
+                    review: "REVIEW_REQUIRED", ci: "FAILURE"),
     ]
 }
 
