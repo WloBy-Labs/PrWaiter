@@ -84,6 +84,16 @@ extension Array where Element == Node {
         return false
     }
 
+    /// 按编号倒序，新节点该插到父块的第几格：
+    /// 插到第一个比它小的前面；都比它大就排末尾。
+    ///
+    /// 只看得懂编号的兄弟（PR 节点），描述块和没编号的一律跳过 ——
+    /// 手工拖出来的顺序不该被自动导入打乱，这里只负责把新来的放进「明显该在的位置」。
+    func descendingSlot(for number: Int, under parent: UUID) -> Int {
+        let siblings = find(parent)?.children ?? []
+        return siblings.firstIndex { ($0.pr ?? Int.max) < number } ?? siblings.count
+    }
+
     func find(_ target: UUID) -> Node? {
         for n in self {
             if n.id == target { return n }
@@ -362,7 +372,9 @@ struct Project: Codable, Identifiable {
         for f in children.sorted(by: { $0.number < $1.number }) {
             let node = Node(kind: .pr, pr: f.number)
             if let p = GhParse.backportParent(from: f.title), let pid = out.nodeID(forPR: p) {
-                out.attach(node, under: pid)
+                // 挂到父块下，位置按编号倒序 —— 新的排在旧的前面，
+                // 跟根级「新的落最上面」是同一个意思，别让新 backport 沉到一堆已合并的下面
+                out.attach(node, under: pid, at: out.descendingSlot(for: f.number, under: pid))
                 out.update(pid) { $0.collapsed = false }   // 别让新挂上去的藏在折叠里
             } else {
                 out.insert(node, at: 0)
