@@ -20,6 +20,7 @@ struct Tests {
         guideTests()
         reorderTests()
         autoImportTests()
+        supersedeTests()
         projectReorderTests()
         statusTests()
         migrationTests()
@@ -314,8 +315,15 @@ struct Tests {
     static func autoImportTests() {
         print("自动导入与 backport 聚合:")
 
-        func open(_ n: Int, _ t: String = "") -> FoundPR { FoundPR(number: n, title: t, isOpen: true) }
-        func shut(_ n: Int, _ t: String = "") -> FoundPR { FoundPR(number: n, title: t, isOpen: false) }
+        func open(_ n: Int, _ t: String = "", _ b: String = "") -> FoundPR {
+            FoundPR(number: n, title: t, state: "OPEN", base: b)
+        }
+        func shut(_ n: Int, _ t: String = "", _ b: String = "") -> FoundPR {
+            FoundPR(number: n, title: t, state: "CLOSED", base: b)
+        }
+        func done(_ n: Int, _ t: String = "", _ b: String = "") -> FoundPR {
+            FoundPR(number: n, title: t, state: "MERGED", base: b)
+        }
 
         // --- 标题解析 ---
         check(GhParse.backportParent(from: "[BugFix] xxx (backport #77408)") == 77408,
@@ -400,6 +408,90 @@ struct Tests {
               "imported 落后于树时补记")
         check(Project.importing([open(100, "x (backport #1)")], nodes: [], imported: [100]) == nil,
               "删掉过的不会被导回来")
+    }
+
+    static func supersedeTests() {
+        print("被顶替的 backport:")
+
+        func open(_ n: Int, _ t: String, _ b: String) -> FoundPR {
+            FoundPR(number: n, title: t, state: "OPEN", base: b)
+        }
+        func shut(_ n: Int, _ t: String, _ b: String) -> FoundPR {
+            FoundPR(number: n, title: t, state: "CLOSED", base: b)
+        }
+        func done(_ n: Int, _ t: String, _ b: String) -> FoundPR {
+            FoundPR(number: n, title: t, state: "MERGED", base: b)
+        }
+        let bp = "[BugFix] Derive the reserve limit (backport #77408)"
+
+        // 真实场景：机器人把三个 backport 关掉，重开了三个，同标题同分支
+        let real = [
+            done(77408, "[BugFix] Derive the reserve limit", "main"),
+            shut(77448, bp, "branch-4.1"), shut(77449, bp, "branch-3.5"), shut(77450, bp, "branch-4.0"),
+            done(77461, bp, "branch-4.1"), done(77463, bp, "branch-3.5"), done(77462, bp, "branch-4.0"),
+            open(77550, bp, "branch-3.5-cc"),
+        ]
+        let dead = supersededPRs(real)
+        check(dead == [77448, 77449, 77450], "关掉后被重开顶替的那三个算作被顶替")
+        check(!dead.contains(77550), "打到别的分支的不算重复 —— branch-3.5-cc 不是 branch-3.5")
+        check(!dead.contains(77461) && !dead.contains(77462) && !dead.contains(77463),
+              "合进去的那些当然不能算被顶替")
+        check(!dead.contains(77408), "父 PR 自己不参与判定")
+
+        // 同一个父 PR、不同分支：两件事，不是重复
+        check(supersededPRs([shut(2, bp, "branch-3.5"), done(3, bp, "branch-4.0")]).isEmpty,
+              "分支不同就不算顶替")
+        // 同一分支、不同父 PR：也是两件事
+        let other = "[BugFix] 另一个改动 (backport #999)"
+        check(supersededPRs([shut(2, bp, "branch-3.5"), done(3, other, "branch-3.5")]).isEmpty,
+              "父 PR 不同就不算顶替")
+        // 一组全关掉了：说明这个 backport 真的被放弃了，值得看见
+        check(supersededPRs([shut(2, bp, "branch-3.5"), shut(3, bp, "branch-3.5")]).isEmpty,
+              "整组都关掉了就都留着")
+        // 分支不明时不猜
+        check(supersededPRs([shut(2, bp, ""), done(3, bp, "")]).isEmpty, "不知道目标分支就不判定")
+
+        // --- 导入口：被顶替的不收 ---
+        let tree = [Node(kind: .pr, pr: 77408)]
+        if let r = Project.importing(real, nodes: tree, imported: [77408]) {
+            let got = Set(r.nodes.allPRNumbers)
+            check(!got.contains(77448) && !got.contains(77449) && !got.contains(77450),
+                  "被顶替的 closed backport 不导入")
+            check(got.isSuperset(of: [77461, 77462, 77463]), "顶替它们的那三个照常导入")
+            check(got.contains(77550), "打到别的分支的照常导入")
+        } else {
+            check(false, "应该有 PR 被导入")
+        }
+
+        // --- 树上已经有的：清掉 ---
+        var trunk = Node(kind: .pr, pr: 77408)
+        trunk.children = [77448, 77449, 77450, 77461, 77462, 77463].map { Node(kind: .pr, pr: $0) }
+        let before = [trunk]
+        if let pruned = Project.pruningSuperseded(nodes: before, facts: real) {
+            check(pruned.allPRNumbers == [77408, 77461, 77462, 77463],
+                  "树上被顶替的那三行清掉，其余不动")
+        } else {
+            check(false, "树上有被顶替的行，应该清掉")
+        }
+        check(Project.pruningSuperseded(nodes: [Node(kind: .pr, pr: 77408)], facts: real) == nil,
+              "没有可清的就返回 nil，不白写一次盘")
+
+        // 有人拿它当依赖、或写过备注的，不动 —— 自动删东西宁可少删
+        var withKid = Node(kind: .pr, pr: 77448)
+        withKid.children = [Node(kind: .pr, pr: 88888)]
+        check(Project.pruningSuperseded(nodes: [withKid], facts: real) == nil, "有子块的不清")
+        var noted = Node(kind: .pr, pr: 77449)
+        noted.note = "这个是我手动关的，留个记号"
+        check(Project.pruningSuperseded(nodes: [noted], facts: real) == nil, "写过备注的不清")
+
+        // 清掉之后不能被下一轮导入捡回来 —— imported 还记着它们
+        if let pruned = Project.pruningSuperseded(nodes: before, facts: real) {
+            let again = Project.importing(real, nodes: pruned,
+                                          imported: [77408, 77448, 77449, 77450,
+                                                     77461, 77462, 77463, 77550])
+            check(again == nil || !Set(again!.nodes.allPRNumbers).contains(77448),
+                  "清掉的不会在下一轮刷新被导回来")
+        }
     }
 
     static func statusTests() {

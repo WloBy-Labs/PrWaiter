@@ -215,7 +215,53 @@ enum Tree {
 struct FoundPR {
     let number: Int
     let title: String
-    let isOpen: Bool
+    let state: String       // OPEN / CLOSED / MERGED
+    let base: String        // 目标分支
+
+    init(number: Int, title: String, state: String, base: String = "") {
+        self.number = number
+        self.title = title
+        self.state = state
+        self.base = base
+    }
+
+    var isOpen: Bool { state == "OPEN" }
+    /// 关掉了、没合进去。注意 MERGED 不算 —— 那是成了
+    var isAbandoned: Bool { state == "CLOSED" }
+}
+
+/// 一个 backport 要干的活：把哪个 PR 搬到哪个分支。
+/// 机器人把 backport 关掉重开时，新旧两个 PR 的这对值是一样的。
+struct BackportJob: Hashable {
+    let parent: Int
+    let base: String
+
+    /// 认不出父 PR、或不知道目标分支的，谈不上「同一个活」，返回 nil
+    init?(_ pr: FoundPR) {
+        guard let p = GhParse.backportParent(from: pr.title), !pr.base.isEmpty else { return nil }
+        parent = p
+        base = pr.base
+    }
+}
+
+/// 已经被顶替掉的那些 backport 的编号。
+///
+/// mergify 之类的机器人会把 backport 关掉重开一个（同一个父 PR、同一个目标分支）。
+/// 关掉的那个既没合进去、活也被别人干了，留在树上只是一行标题一模一样的噪音。
+///
+/// 判定卡得很死：**父 PR 和目标分支都相同**，且这组里至少有一个没被关掉。
+/// 只看标题会误伤 —— 同一个改动打到 branch-3.5 和 branch-4.0 是两件事，标题却一样。
+/// 一组全关掉了就都留着：那说明这个 backport 是真的被放弃了，值得看见。
+func supersededPRs(_ prs: [FoundPR]) -> Set<Int> {
+    var byJob: [BackportJob: [FoundPR]] = [:]
+    for p in prs {
+        if let job = BackportJob(p) { byJob[job, default: []].append(p) }
+    }
+    var out: Set<Int> = []
+    for (_, group) in byJob where group.contains(where: { !$0.isAbandoned }) {
+        out.formUnion(group.filter(\.isAbandoned).map(\.number))
+    }
+    return out
 }
 
 struct Project: Codable, Identifiable {
@@ -246,11 +292,13 @@ struct Project: Codable, Identifiable {
 
     /// 把查到的 PR 里没见过的那些放进树。纯函数，返回 nil 表示没有变化。
     ///
-    /// 三条规则：
+    /// 四条规则：
     /// 1. open 的一律收 —— 手头还在推进的东西
     /// 2. 已关闭 / 已合并的**只收和已跟踪 PR 有关系的**（是某个已跟踪 PR 的 backport，
     ///    或者是某个已跟踪 backport 的父 PR）。否则历史上几十个 PR 会全倒进来
-    /// 3. 认得出父 PR 且父 PR 在树里的，直接挂到它下面 —— backport 本来就是
+    /// 3. **被顶替掉的 closed backport 不收** —— 关掉重开的那个旧号，标题和新号
+    ///    一字不差，收进来就是白白多一行（见 supersededPRs）
+    /// 4. 认得出父 PR 且父 PR 在树里的，直接挂到它下面 —— backport 本来就是
     ///    「等主干那个先合」的先后关系；认不出的落在根级顶部
     ///
     /// 「没见过」= 既不在 imported 里、也不在树里。后半个条件让手工加过的 PR
@@ -270,7 +318,12 @@ struct Project: Codable, Identifiable {
             related.contains(f.number) ? GhParse.backportParent(from: f.title) : nil
         })
 
+        // 顶替判定要看全量 found，不能只看候选 —— 顶替它的那个新 PR
+        // 多半早就在树里了，不在候选里
+        let dead = supersededPRs(found)
+
         let fresh = candidates.filter { c in
+            if dead.contains(c.number) { return false }
             if c.isOpen { return true }
             if let p = GhParse.backportParent(from: c.title), related.contains(p) { return true }
             return parentOfTracked.contains(c.number)
@@ -301,6 +354,30 @@ struct Project: Codable, Identifiable {
             }
         }
         return (out, merged)
+    }
+
+    /// 树里那些已经被顶替掉的 closed backport，清掉。返回 nil 表示没有可清的。
+    ///
+    /// 光在导入口拦住不够 —— 顶替是后来才发生的：机器人今天把昨天导进来的
+    /// backport 关掉重开，那一行昨天进来时还是正常的。
+    ///
+    /// 只清干净的：**有子块或有备注的一律不动**。子块挂在它下面说明有人拿它当依赖，
+    /// 备注是手写的，都不该被自动清掉 —— 自动删东西这件事，宁可少删。
+    static func pruningSuperseded(nodes: [Node], facts: [FoundPR]) -> [Node]? {
+        let dead = supersededPRs(facts)
+        guard !dead.isEmpty else { return nil }
+
+        func prune(_ ns: [Node]) -> [Node] {
+            ns.compactMap { n in
+                var n = n
+                n.children = prune(n.children)
+                let removable = n.kind == .pr && n.children.isEmpty && n.note.isEmpty
+                if let pr = n.pr, removable, dead.contains(pr) { return nil }
+                return n
+            }
+        }
+        let out = prune(nodes)
+        return out.allPRNumbers == nodes.allPRNumbers ? nil : out
     }
 }
 
@@ -476,6 +553,7 @@ struct LivePR {
     var state = ""      // OPEN / MERGED / CLOSED
     var url = ""
     var author = ""
+    var base = ""       // 目标分支
     var isDraft = false
     var review: String? // APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
@@ -891,16 +969,26 @@ final class Model: ObservableObject {
         }
     }
 
-    /// 把当前 gh 账号在该仓库下所有 open 的 PR 导进来（只导没见过的）
+    /// 把当前 gh 账号在该仓库下所有 open 的 PR 导进来（只导没见过的），
+    /// 顺便清掉已经被顶替的那些 closed backport
     func importMyOpenPRs(into pid: UUID, repo: String) async {
         guard let found = try? await Self.fetchMyPRs(repo: repo) else { return }
         guard let i = store.projects.firstIndex(where: { $0.id == pid }) else { return }
-        guard let r = Project.importing(found,
-                                        nodes: store.projects[i].nodes,
-                                        imported: store.projects[i].imported) else { return }
-        store.projects[i].nodes = r.nodes
-        store.projects[i].imported = r.imported
-        save()
+        var changed = false
+
+        // 先清后导：清掉的编号还留在 imported 里，导入那步不会再把它收回来
+        if let pruned = Project.pruningSuperseded(nodes: store.projects[i].nodes, facts: found) {
+            store.projects[i].nodes = pruned
+            changed = true
+        }
+        if let r = Project.importing(found,
+                                     nodes: store.projects[i].nodes,
+                                     imported: store.projects[i].imported) {
+            store.projects[i].nodes = r.nodes
+            store.projects[i].imported = r.imported
+            changed = true
+        }
+        if changed { save() }
     }
 
     // GUI app 不继承 shell 的 PATH，得自己找。找不到再退一步问一次登录 shell。
@@ -1084,7 +1172,8 @@ final class Model: ObservableObject {
         // --state all：已关闭的也要，好把「主干合了但 backport 被关掉」这种情况显出来。
         // 收不收由 Project.importing 决定 —— 只收和已跟踪 PR 有关系的那些。
         let out = try await run(gh, ["pr", "list", "-R", repo, "--state", "all",
-                                     "--limit", "200", "--json", "number,title,state"] + filter)
+                                     "--limit", "200",
+                                     "--json", "number,title,state,baseRefName"] + filter)
         guard let arr = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [[String: Any]]
         else {
             throw AppError(out.stderr.isEmpty ? "gh pr list 调用失败" : out.stderr)
@@ -1093,7 +1182,8 @@ final class Model: ObservableObject {
             guard let n = d["number"] as? Int else { return nil }
             return FoundPR(number: n,
                            title: d["title"] as? String ?? "",
-                           isOpen: (d["state"] as? String) == "OPEN")
+                           state: d["state"] as? String ?? "",
+                           base: d["baseRefName"] as? String ?? "")
         }
     }
 
@@ -1106,7 +1196,7 @@ final class Model: ObservableObject {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
         }
         let parts = repo.split(separator: "/")
-        let fields = "number title state isDraft url reviewDecision author { login } "
+        let fields = "number title state isDraft url reviewDecision baseRefName author { login } "
             + "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
         let aliases = numbers.sorted()
             .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
@@ -1133,6 +1223,7 @@ final class Model: ObservableObject {
             lv.review = v["reviewDecision"] as? String
             lv.ci = rollup?["state"] as? String
             lv.author = (v["author"] as? [String: Any])?["login"] as? String ?? ""
+            lv.base = v["baseRefName"] as? String ?? ""
             live[n] = lv
         }
         // 个别编号不存在时 GraphQL 只报部分错误，能拿到的照常显示；全军覆没才抛错
@@ -2221,6 +2312,7 @@ struct NodeRow: View {
                 if m.editing { deleteButton }
             }
             HStack(spacing: 6) {
+                baseBranch(lv)
                 if m.editing {
                     TextField("备注…", text: $draft)
                         .textFieldStyle(.plain)
@@ -2252,6 +2344,20 @@ struct NodeRow: View {
         Image(systemName: "line.3.horizontal")
             .foregroundColor(.secondary)
             .help("拖动以重新归类")
+    }
+
+    /// 目标分支。一组 backport 的标题一字不差，唯一的区别就是打到哪个分支上 ——
+    /// 不显出来，六行长得一模一样的 PR 看着就像重复了。
+    @ViewBuilder
+    func baseBranch(_ lv: LivePR?) -> some View {
+        if let lv, !lv.base.isEmpty {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.branch").font(.system(size: 9))
+                Text(lv.base)
+            }
+            .foregroundColor(.secondary)
+            .help("目标分支")
+        }
     }
 
     /// 创建人，靠右和上面一行的状态排成一列。
