@@ -789,11 +789,29 @@ final class Model: ObservableObject {
         guard repo.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil else {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
         }
-        let out = try await run(gh, [
-            "pr", "list", "-R", repo,
-            "--author", "@me", "--state", "open",
-            "--limit", "200", "--json", "number",
-        ])
+        // 作者是我、或者指派给我，两者取并集。
+        // 机器人自动建的 backport 常常作者是 bot、只把你设成 assignee，
+        // 光看 author 会漏掉。gh 的两个过滤条件是 AND，所以只能查两次再合并。
+        async let mine = listOpenPRs(gh, repo: repo, filter: ["--author", "@me"])
+        async let assigned = listOpenPRs(gh, repo: repo, filter: ["--assignee", "@me"])
+
+        var numbers = Set<Int>()
+        var failures: [Error] = []
+        for r in [try? await mine, try? await assigned] {
+            if let r { numbers.formUnion(r) } else { failures.append(AppError("查询失败")) }
+        }
+        // 一条挂了另一条还能用，就用能用的那份；两条都挂才算失败
+        if failures.count == 2 {
+            throw AppError("gh pr list 调用失败")
+        }
+        return numbers.sorted()
+    }
+
+    private nonisolated static func listOpenPRs(
+        _ gh: String, repo: String, filter: [String]
+    ) async throws -> [Int] {
+        let out = try await run(gh, ["pr", "list", "-R", repo, "--state", "open",
+                                     "--limit", "200", "--json", "number"] + filter)
         guard let arr = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [[String: Any]]
         else {
             throw AppError(out.stderr.isEmpty ? "gh pr list 调用失败" : out.stderr)
@@ -1525,8 +1543,9 @@ struct SettingsView: View {
         } header: {
             Text("刷新")
         } footer: {
-            Text("每次刷新会先把当前 gh 账号在该仓库下所有 open 的 PR 导进来（落在根级最上面），"
-                 + "再用一条 GraphQL 请求拉回全部状态。\n"
+            Text("每次刷新会先把该仓库下**作者是我、或指派给我**的 open PR 导进来"
+                 + "（落在根级最上面），再用一条 GraphQL 请求拉回全部状态。"
+                 + "算上 assignee 是因为机器人自动建的 backport 常常作者是 bot、只把你设成指派人。\n"
                  + "每个 PR 只导入一次：删掉之后不会再被导回来，已合并 / 已关闭的也不会被清走。")
             .font(.caption)
             .foregroundColor(.secondary)
