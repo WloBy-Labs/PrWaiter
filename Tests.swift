@@ -21,6 +21,7 @@ struct Tests {
         reorderTests()
         subLevelReorderTests()
         autoImportTests()
+        importOrderTests()
         reparentTests()
         projectReorderTests()
         statusTests()
@@ -497,6 +498,78 @@ struct Tests {
               "imported 落后于树时补记")
         check(Project.importing([open(100, "x (backport #1)")], nodes: [], imported: [100]) == nil,
               "删掉过的不会被导回来")
+    }
+
+    static func importOrderTests() {
+        print("导入位置:")
+
+        func open(_ n: Int, _ t: String = "") -> FoundPR { FoundPR(number: n, title: t, isOpen: true) }
+        let bp = { (n: Int) in "[BugFix] 修一个 bug (backport #\(n))" }
+
+        // --- 根级：新来的落在所有根节点最上面 ---
+        let existing = [Node(kind: .topic, title: "已有的组"), Node(kind: .pr, pr: 100)]
+        if let r = Project.importing([open(300), open(200)], nodes: existing, imported: [100]) {
+            check(r.nodes.map(\.pr) == [300, 200, nil, 100], "新 PR 落在最上面，编号大的更靠上")
+            check(r.nodes[2].kind == .topic, "已有的描述块被顶下去，但顺序没乱")
+        } else {
+            check(false, "根级 PR 应该被导入")
+        }
+
+        // --- 子层：按编号倒序插进去 ---
+        var parent = Node(kind: .pr, pr: 500)
+        parent.children = [Node(kind: .pr, pr: 300), Node(kind: .pr, pr: 100)]
+        let kids = { (ns: [Node]) in ns.find(parent.id)?.children.map(\.pr) ?? [] }
+
+        // 最大的排最前
+        if let r = Project.importing([open(400, bp(500))], nodes: [parent], imported: [500, 300, 100]) {
+            check(kids(r.nodes) == [400, 300, 100], "新 backport 按编号插到比它小的那些前面")
+        } else {
+            check(false, "backport 应该被导入")
+        }
+        // 比谁都大 → 排最前
+        if let r = Project.importing([open(900, bp(500))], nodes: [parent], imported: [500, 300, 100]) {
+            check(kids(r.nodes) == [900, 300, 100], "编号最大的排在同层最前")
+        } else {
+            check(false, "backport 应该被导入")
+        }
+        // 比谁都小 → 排末尾
+        if let r = Project.importing([open(50, bp(500))], nodes: [parent], imported: [500, 300, 100]) {
+            check(kids(r.nodes) == [300, 100, 50], "编号最小的排在同层末尾")
+        } else {
+            check(false, "backport 应该被导入")
+        }
+        // 一批一起进来，彼此之间也要倒序
+        if let r = Project.importing([open(200, bp(500)), open(400, bp(500)), open(150, bp(500))],
+                                     nodes: [parent], imported: [500, 300, 100]) {
+            check(kids(r.nodes) == [400, 300, 200, 150, 100], "同一批多个 backport 各就各位")
+        } else {
+            check(false, "backport 应该被导入")
+        }
+
+        // 空父块
+        let bare = [Node(kind: .pr, pr: 500)]
+        if let r = Project.importing([open(400, bp(500))], nodes: bare, imported: [500]) {
+            check(r.nodes.first?.children.map(\.pr) == [400], "父块本来没孩子时也能挂上")
+        } else {
+            check(false, "backport 应该被导入")
+        }
+
+        // 手工摆的顺序不是倒序时，也得给个说得通的位置：插到第一个比它小的前面
+        var messy = Node(kind: .pr, pr: 500)
+        messy.children = [Node(kind: .pr, pr: 100), Node(kind: .pr, pr: 400)]
+        if let r = Project.importing([open(200, bp(500))], nodes: [messy], imported: [500, 100, 400]) {
+            check(r.nodes.find(messy.id)?.children.map(\.pr) == [200, 100, 400],
+                  "同层顺序被手工打乱过时，插到第一个比它小的前面，不重排别人")
+        } else {
+            check(false, "backport 应该被导入")
+        }
+
+        // 认不出父 PR 的 backport 照旧落根级顶部
+        if let r = Project.importing([open(700, bp(999))], nodes: [parent], imported: [500, 300, 100]) {
+            check(r.nodes.map(\.pr) == [700, 500], "父 PR 不在树里的落在根级最上面")
+        } else {
+            check(false, "应该被导入")
+        }
     }
 
     static func reparentTests() {
