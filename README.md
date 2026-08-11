@@ -86,7 +86,11 @@ scripts/make_dmg.sh                  # 产出 dist/PrWaiter-<版本>.dmg
   只把你设成指派人，光看 author 会漏掉。可以在设置里关掉
 - **backport 自动聚合**：标题里认出 `(backport #77408)` 就直接挂到父 PR 下面 ——
   backport 本来就是「等主干先合」的先后关系。也认 `backport of #N` / `cherry-pick #N`。
-  认不出父 PR、或父 PR 不在树里的，照旧落在根级
+  认不出父 PR、或父 PR 不在树里的，照旧落在根级。
+  标题里有**多个** backport 引用时（`(backport #77408) (backport #77463)`，
+  backport 的 backport），取**最后**那个当父节点 —— 那才是直接的上一手，
+  挂到第一个会跳过中间一环
+- **每行显示目标分支**：一组 backport 的标题一字不差，唯一的区别就是打到哪个分支上
 - **已关闭的关联 PR 也会进来**：只收和已跟踪 PR 有关系的那些（某个已跟踪 PR 的 backport，
   或某个已跟踪 backport 的父 PR）。这样「主干合了但某个 backport 被关掉」会直接显在树上，
   而不是把历史上几十个无关 PR 全倒进来

@@ -194,6 +194,44 @@ enum Tree {
         return nodes
     }
 
+    /// 一次性修正：早先版本取标题里**第一个** backport 引用当父节点，
+    /// 多重 backport（`(backport #77408) (backport #77463)`）会被挂到最上游那个，
+    /// 跳过中间一环。这里把它们搬到正确的上一手下面。
+    ///
+    /// 只动「当前父节点正好是标题里某个更早的引用」的那些 —— 那是老规则留下的手笔。
+    /// 你自己拖到别处的、或者已经在对的地方的，一律不动。
+    static func reparenting(_ nodes: [Node], titles: [Int: String]) -> [Node]? {
+        var out = nodes
+
+        /// 每个 PR 节点当前挂在哪个 PR 编号下面（挂在描述块或根级的记 nil）
+        func parents(_ ns: [Node], under: Int?) -> [Int: Int?] {
+            var map: [Int: Int?] = [:]
+            for n in ns {
+                if let pr = n.pr { map[pr] = under }
+                map.merge(parents(n.children, under: n.kind == .pr ? n.pr : under)) { a, _ in a }
+            }
+            return map
+        }
+
+        for (pr, parent) in parents(nodes, under: nil) {
+            let refs = GhParse.backportParents(from: titles[pr] ?? "")
+            guard refs.count > 1, let want = refs.last, want != parent else { continue }
+            // 现在挂着的必须是更早的那几个引用之一，才认定是老规则摆的
+            guard let parent, refs.dropLast().contains(parent) else { continue }
+            guard let id = out.nodeID(forPR: pr), let target = out.nodeID(forPR: want) else { continue }
+            if let moved = Tree.move(id, under: target, in: out) { out = moved }
+        }
+        return changed(nodes, out) ? out : nil
+    }
+
+    /// 结构变没变。编号集合一样也可能换了位置，所以比的是铺平后的父子关系
+    private static func changed(_ a: [Node], _ b: [Node]) -> Bool {
+        func shape(_ ns: [Node], _ depth: Int) -> [String] {
+            ns.flatMap { ["\($0.pr ?? -1)@\(depth)"] + shape($0.children, depth + 1) }
+        }
+        return shape(a, 0) != shape(b, 0)
+    }
+
     /// 把节点挪到根级的第 index 个位置（index 是「插到谁前面」，等于 count 表示放末尾）。
     /// 嵌套节点拖过来也走这里，等于同时出组 + 定位。
     static func move(_ dragged: UUID, toRootIndex index: Int, in nodes: [Node]) -> [Node]? {
@@ -233,7 +271,11 @@ struct Project: Codable, Identifiable {
         self.nodes = nodes
     }
 
-    enum CodingKeys: String, CodingKey { case id, name, repo, nodes, imported }
+    /// 「多重 backport 的父节点认错了」这个修正跑过没有。一次性的，跑完就置位 ——
+    /// 每次刷新都跑的话，你手动把它拖到别处，下一拍又被搬回来了。
+    var reparented = false
+
+    enum CodingKeys: String, CodingKey { case id, name, repo, nodes, imported, reparented }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -242,6 +284,7 @@ struct Project: Codable, Identifiable {
         repo = try c.decodeIfPresent(String.self, forKey: .repo) ?? ""
         nodes = try c.decodeIfPresent([Node].self, forKey: .nodes) ?? []
         imported = try c.decodeIfPresent([Int].self, forKey: .imported) ?? []
+        reparented = try c.decodeIfPresent(Bool.self, forKey: .reparented) ?? false
     }
 
     /// 把查到的 PR 里没见过的那些放进树。纯函数，返回 nil 表示没有变化。
@@ -439,16 +482,33 @@ enum GhParse {
         return nil
     }
 
-    /// 从 PR 标题里认出「这是谁的 backport」。
+    /// 标题里所有的 backport 引用，按出现顺序。
     /// StarRocks 的 mergify 会生成 "…… (backport #77408)"，其他仓库常见
     /// "backport of #123" / "cherry-pick #123"，都收进来。
     /// 实测 51 个 PR 里 40 个能解析出父 PR，解析不出的正是主干 PR 本身。
-    static func backportParent(from title: String) -> Int? {
+    static func backportParents(from title: String) -> [Int] {
         let pattern = #"(?i)(?:backport|cherry[- ]?pick)(?:ed)?(?:\s+(?:of|from))?[^#\d]{0,12}#(\d+)"#
-        guard let m = title.range(of: pattern, options: .regularExpression) else { return nil }
-        // 取匹配段里最后一串数字，也就是 # 后面那个编号
-        guard let numRange = title[m].range(of: #"\d+$"#, options: .regularExpression) else { return nil }
-        return Int(title[m][numRange])
+        var out: [Int] = []
+        var rest = Substring(title)
+        while let m = rest.range(of: pattern, options: .regularExpression) {
+            // 取匹配段里最后一串数字，也就是 # 后面那个编号
+            if let numRange = rest[m].range(of: #"\d+$"#, options: .regularExpression),
+               let n = Int(rest[m][numRange]) {
+                out.append(n)
+            }
+            rest = rest[m.upperBound...]
+        }
+        return out
+    }
+
+    /// 直接的上一手是谁。
+    ///
+    /// 取**最后**一个引用，不是第一个：backport 再 backport 时，
+    /// 标题会一路带上来源 —— `…… (backport #77408) (backport #77463)`
+    /// 说的是「先有 #77408，再有它的 backport #77463，这个是从 #77463 来的」。
+    /// 挂在 #77463 下面才是真正的先后关系；挂到 #77408 下面会跳过中间那一环。
+    static func backportParent(from title: String) -> Int? {
+        backportParents(from: title).last
     }
 
     /// 按优先级排出候选路径：自定义 > 常见安装位置 > PATH 里的每一段
@@ -476,6 +536,7 @@ struct LivePR {
     var state = ""      // OPEN / MERGED / CLOSED
     var url = ""
     var author = ""
+    var base = ""       // 目标分支
     var isDraft = false
     var review: String? // APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
@@ -883,12 +944,25 @@ final class Model: ObservableObject {
             return
         }
         do {
-            liveByProject[pid] = try await Self.fetchLive(repo: cur.repo, numbers: numbers)
+            let live = try await Self.fetchLive(repo: cur.repo, numbers: numbers)
+            liveByProject[pid] = live
             fetchedAt[pid] = Date()
             error = nil
+            fixBackportParents(in: pid, titles: live.mapValues(\.title))
         } catch let e {
             error = e.localizedDescription
         }
+    }
+
+    /// 一次性把多重 backport 的父节点摆正。要标题才能判断，所以放在拉完状态之后。
+    func fixBackportParents(in pid: UUID, titles: [Int: String]) {
+        guard let i = store.projects.firstIndex(where: { $0.id == pid }),
+              !store.projects[i].reparented else { return }
+        if let fixed = Tree.reparenting(store.projects[i].nodes, titles: titles) {
+            store.projects[i].nodes = fixed
+        }
+        store.projects[i].reparented = true
+        save()
     }
 
     /// 把当前 gh 账号在该仓库下所有 open 的 PR 导进来（只导没见过的）
@@ -1106,7 +1180,7 @@ final class Model: ObservableObject {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
         }
         let parts = repo.split(separator: "/")
-        let fields = "number title state isDraft url reviewDecision author { login } "
+        let fields = "number title state isDraft url reviewDecision baseRefName author { login } "
             + "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
         let aliases = numbers.sorted()
             .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
@@ -1133,6 +1207,7 @@ final class Model: ObservableObject {
             lv.review = v["reviewDecision"] as? String
             lv.ci = rollup?["state"] as? String
             lv.author = (v["author"] as? [String: Any])?["login"] as? String ?? ""
+            lv.base = v["baseRefName"] as? String ?? ""
             live[n] = lv
         }
         // 个别编号不存在时 GraphQL 只报部分错误，能拿到的照常显示；全军覆没才抛错
@@ -2221,6 +2296,7 @@ struct NodeRow: View {
                 if m.editing { deleteButton }
             }
             HStack(spacing: 6) {
+                baseBranch(lv)
                 if m.editing {
                     TextField("备注…", text: $draft)
                         .textFieldStyle(.plain)
@@ -2252,6 +2328,20 @@ struct NodeRow: View {
         Image(systemName: "line.3.horizontal")
             .foregroundColor(.secondary)
             .help("拖动以重新归类")
+    }
+
+    /// 目标分支。一组 backport 的标题一字不差，唯一的区别就是打到哪个分支上 ——
+    /// 不显出来，几行长得一模一样的 PR 看着就像重复了。
+    @ViewBuilder
+    func baseBranch(_ lv: LivePR?) -> some View {
+        if let lv, !lv.base.isEmpty {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.branch").font(.system(size: 9))
+                Text(lv.base)
+            }
+            .foregroundColor(.secondary)
+            .help("目标分支")
+        }
     }
 
     /// 创建人，靠右和上面一行的状态排成一列。

@@ -20,6 +20,7 @@ struct Tests {
         guideTests()
         reorderTests()
         autoImportTests()
+        reparentTests()
         projectReorderTests()
         statusTests()
         migrationTests()
@@ -328,6 +329,30 @@ struct Tests {
         check(GhParse.backportParent(from: "fix #123 crash") == nil,
               "只是引用了 issue，不是 backport，不能误判")
 
+        // --- 多重 backport：取最后一个引用 ---
+        // backport 再 backport 时标题会一路带上来源，最后那个才是直接的上一手。
+        // 挂到第一个（最上游）会跳过中间那一环，先后关系就断了。
+        let chained = "[BugFix] Derive the reserve limit (backport #77408) (backport #77463)"
+        check(GhParse.backportParents(from: chained) == [77408, 77463], "解析出全部引用，保持顺序")
+        check(GhParse.backportParent(from: chained) == 77463, "父节点取最后一个引用，不是第一个")
+        check(GhParse.backportParents(from: "[BugFix] xxx (backport #77408)") == [77408],
+              "只有一个引用时就是它")
+        check(GhParse.backportParents(from: "[BugFix] 主干 PR").isEmpty, "主干 PR 解析不出引用")
+        check(GhParse.backportParents(from: "fix #1 and #2 crash").isEmpty,
+              "光有 # 编号、没有 backport 字样的不算")
+
+        // 链式 backport 应该挂到中间那一环下面，而不是最上游
+        var trunk = Node(kind: .pr, pr: 77408)
+        trunk.children = [Node(kind: .pr, pr: 77463)]
+        if let r = Project.importing([FoundPR(number: 77550, title: chained, isOpen: true)],
+                                     nodes: [trunk], imported: [77408, 77463]) {
+            let mid = r.nodes.find(77463)
+            check(mid?.children.map(\.pr) == [77550], "链式 backport 挂在上一手下面")
+            check(r.nodes.find(77408)?.children.map(\.pr) == [77463], "不会跳过中间那一环")
+        } else {
+            check(false, "链式 backport 应该被导入")
+        }
+
         // --- open 一律收，没有父 PR 的落根级顶部 ---
         let base = [Node(kind: .pr, pr: 100)]
         if let r = Project.importing([open(200), open(201)], nodes: base, imported: [100]) {
@@ -400,6 +425,56 @@ struct Tests {
               "imported 落后于树时补记")
         check(Project.importing([open(100, "x (backport #1)")], nodes: [], imported: [100]) == nil,
               "删掉过的不会被导回来")
+    }
+
+    static func reparentTests() {
+        print("多重 backport 的父节点修正:")
+
+        let chained = "[BugFix] Derive the reserve limit (backport #77408) (backport #77463)"
+        let titles = [77408: "[BugFix] Derive the reserve limit",
+                      77463: "[BugFix] Derive the reserve limit (backport #77408)",
+                      77550: chained,
+                      77461: "[BugFix] Derive the reserve limit (backport #77408)"]
+
+        // 老规则把 77550 挂到了最上游的 77408 下面，应该搬到 77463 下面
+        var trunk = Node(kind: .pr, pr: 77408)
+        trunk.children = [Node(kind: .pr, pr: 77463), Node(kind: .pr, pr: 77550)]
+        guard let fixed = Tree.reparenting([trunk], titles: titles) else {
+            check(false, "摆错了位置的应该被搬走"); return
+        }
+        check(fixed.find(77463)?.children.map(\.pr) == [77550], "搬到了正确的上一手下面")
+        check(fixed.find(77408)?.children.map(\.pr) == [77463], "原来的位置腾出来了")
+        check(fixed.allPRNumbers.sorted() == [77408, 77463, 77550], "一个都没丢")
+
+        // 已经在对的地方：不动，也不白写一次盘
+        var mid = Node(kind: .pr, pr: 77463)
+        mid.children = [Node(kind: .pr, pr: 77550)]
+        var root = Node(kind: .pr, pr: 77408)
+        root.children = [mid]
+        check(Tree.reparenting([root], titles: titles) == nil, "已经挂对了就不动")
+
+        // 只有一个引用的，谈不上摆错
+        var single = Node(kind: .pr, pr: 77408)
+        single.children = [Node(kind: .pr, pr: 77461)]
+        check(Tree.reparenting([single], titles: titles) == nil, "单个引用的不参与修正")
+
+        // 你自己拖到别处的不动 —— 当前父节点不是标题里更早的引用，就不是老规则摆的
+        var elsewhere = Node(kind: .topic, title: "手工分的组")
+        elsewhere.children = [Node(kind: .pr, pr: 77550)]
+        check(Tree.reparenting([elsewhere, Node(kind: .pr, pr: 77463)], titles: titles) == nil,
+              "手工拖到描述块下的不动")
+        var other = Node(kind: .pr, pr: 99999)
+        other.children = [Node(kind: .pr, pr: 77550)]
+        check(Tree.reparenting([other, Node(kind: .pr, pr: 77463)], titles: titles) == nil,
+              "挂在无关 PR 下的不动（那是手工摆的）")
+
+        // 正确的上一手不在树里：没处搬，就别搬
+        var lonely = Node(kind: .pr, pr: 77408)
+        lonely.children = [Node(kind: .pr, pr: 77550)]
+        check(Tree.reparenting([lonely], titles: titles) == nil, "目标不在树里就不动")
+
+        // 拉不到标题时不猜
+        check(Tree.reparenting([trunk], titles: [:]) == nil, "没有标题就不动")
     }
 
     static func statusTests() {
