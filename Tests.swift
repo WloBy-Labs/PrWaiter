@@ -29,6 +29,7 @@ struct Tests {
         codableTests()
         ghParseTests()
         versionTests()
+        tourTests()
 
         print(failed == 0 ? "\n全部通过" : "\n\(failed) 项失败")
         exit(failed == 0 ? 0 : 1)
@@ -815,6 +816,49 @@ struct Tests {
 
         check(Version.parts("v0.9.0") == [0, 9, 0], "解析出各段数字")
         check(Version.parts("1.2.3-beta") == [1, 2, 3], "带后缀时只取数字部分")
+    }
+
+    static func tourTests() {
+        print("上手导览:")
+
+        // 导览的全部价值就是「指着某个控件讲」。哪一步没有目标，
+        // 遮罩就挖不出洞，那一步会退化成一个居中的对话框 —— 那不叫导览。
+        check(TourStep.all.allSatisfy { $0.target != nil }, "每一步都指着一个真实控件")
+        check(!TourStep.all.isEmpty, "至少有一步")
+
+        // 首次启动用户一条数据都没有，靠样板数据兜底
+        let rows = Tree.flatten(TourDemo.nodes) { TourDemo.live[$0]?.state == "MERGED" }
+        check(rows.contains { $0.node.kind == .topic }, "样板里有描述块，第 2、4 步才有得指")
+        check(rows.contains { $0.node.kind == .pr }, "样板里有 PR 行，第 3、6 步才有得指")
+
+        // 每一步的目标都得真能在样板界面上出现，否则等于没目标
+        let reachable: Set<TourTarget> = [
+            .projectTabs, .editButton, .gearButton, .refreshButton,   // 控制条常驻
+            .topicRow, .collapseZone,                                 // 描述块样板行
+            .statusBadges, .dragGrip,                                 // PR 样板行
+        ]
+        check(TourStep.all.allSatisfy { reachable.contains($0.target!) }, "目标都在样板界面里存在")
+
+        // 讲颜色那一步得有几种不同的颜色可看，一水儿的灰讲不清楚
+        let statuses = rows.filter { $0.node.kind == .pr }.map {
+            Model.classify(TourDemo.live[$0.node.pr ?? 0], blocked: $0.blocked)
+        }
+        check(Set(statuses).count >= 3, "样板 PR 覆盖至少三种状态")
+        check(statuses.contains(.ready), "有「可以合了」")
+        check(statuses.contains(.blocked), "有「等上游」—— 缩进的意义全在这")
+        check(statuses.contains(.ciFailed), "有「CI 挂了」")
+
+        // 「缩进就是先后关系」那一步靠嵌套演示，样板必须真的是嵌套的
+        check(rows.contains { $0.depth >= 2 }, "样板有两层以上嵌套")
+        check(rows.contains { $0.node.kind == .pr && $0.blocked }, "有 PR 被上游挡着")
+
+        // 拖动手柄只在编辑态出现，所以那一步得声明自己要编辑态
+        let grip = TourStep.all.first { $0.target == .dragGrip }
+        check(grip?.needsEditing == true, "讲拖拽那一步会把手柄显出来")
+        check(TourStep.all.filter { $0.needsEditing }.count == 1, "只有拖拽那一步需要编辑态")
+
+        // 编号用 900+，跟真 PR 一眼分得开
+        check(TourDemo.live.keys.allSatisfy { $0 >= 900 }, "样板编号不会跟真 PR 混淆")
     }
 }
 
