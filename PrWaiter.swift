@@ -955,8 +955,9 @@ final class Model: ObservableObject {
 
     static let repoSlug = "WloBy-Labs/PrWaiter"
 
-    /// 查最新发布。走 gh 而不是匿名 HTTP —— 仓库是 private，匿名请求什么都拿不到，
-    /// 而 gh 本来就带着用户的认证。
+    /// 查最新发布。走 gh 而不是匿名 HTTP：GitHub 对未认证请求限 60 次/小时且按 IP 计，
+    /// 公司出口 IP 后面很容易撞上 403（实测就撞到过）；gh 带认证，限额 5000 次/小时。
+    /// 顺带也不用再引一套网络栈，仓库将来转 private 也不用改。
     nonisolated static func fetchLatestRelease() async throws -> ReleaseInfo {
         guard let gh = ghPath() else { throw AppError("找不到 GitHub CLI（gh）") }
         let out = try await run(gh, ["release", "view", "--repo", repoSlug,
@@ -1868,7 +1869,8 @@ struct SettingsView: View {
         } header: {
             Text("更新")
         } footer: {
-            Text("更新走 gh 拉 Release —— 仓库是 private，匿名请求拿不到，而 gh 本来就带着你的认证。"
+            Text("更新走 gh 拉 Release —— 匿名 API 限 60 次/小时且按 IP 计，很容易撞上限额；"
+                 + "gh 带认证，限额高得多。"
                  + "安装会校验下载包的签名，然后替换 /Applications 里的 App 并重启。\n"
                  + "「自动安装」默认关：替换正在运行的 App 会让它重启，"
                  + "这种事不该在你不知情时发生。")
