@@ -69,15 +69,17 @@ extension Array where Element == Node {
         return nil
     }
 
-    /// 挂到指定父节点下，找不到父节点则返回 false
+    /// 挂到指定父节点下，找不到父节点则返回 false。
+    /// at 为 nil 表示挂在末尾（拖到块身上就是这个意思），给了下标就插到那一格。
     @discardableResult
-    mutating func attach(_ node: Node, under parent: UUID) -> Bool {
+    mutating func attach(_ node: Node, under parent: UUID, at index: Int? = nil) -> Bool {
         for i in indices {
             if self[i].id == parent {
-                self[i].children.append(node)
+                let at = index.map { Swift.max(0, Swift.min($0, self[i].children.count)) }
+                self[i].children.insert(node, at: at ?? self[i].children.count)
                 return true
             }
-            if self[i].children.attach(node, under: parent) { return true }
+            if self[i].children.attach(node, under: parent, at: index) { return true }
         }
         return false
     }
@@ -145,6 +147,8 @@ struct Row: Identifiable {
     /// 画竖线时用：祖先不是最后一个，说明它下面还有兄弟，那一列就要continue 竖线。
     let trail: [Bool]
     let descendants: Int    // 子孙总数，折叠时显示藏了多少
+    let parent: UUID?       // 归谁管，根级为 nil
+    let index: Int          // 在同层兄弟里排第几
 
     var id: UUID { node.id }
 }
@@ -155,22 +159,24 @@ enum Tree {
         func countAll(_ ns: [Node]) -> Int {
             ns.reduce(0) { $0 + 1 + countAll($1.children) }
         }
-        func walk(_ ns: [Node], _ depth: Int, _ blocked: Bool, _ hidden: Bool, _ trail: [Bool]) -> [Row] {
+        func walk(_ ns: [Node], _ depth: Int, _ blocked: Bool, _ hidden: Bool,
+                  _ trail: [Bool], _ parent: UUID?) -> [Row] {
             ns.enumerated().flatMap { i, n -> [Row] in
                 let isLast = i == ns.count - 1
                 let row = Row(
                     node: n, depth: depth, blocked: blocked, hidden: hidden,
-                    isLast: isLast, trail: trail, descendants: countAll(n.children)
+                    isLast: isLast, trail: trail, descendants: countAll(n.children),
+                    parent: parent, index: i
                 )
                 // 描述块只做分组，不参与先后关系；PR 没合并才挡住下面的
                 let childBlocked = n.kind == .pr
                     ? blocked || !(n.pr.map(isMerged) ?? false)
                     : blocked
                 return [row] + walk(n.children, depth + 1, childBlocked, hidden || n.collapsed,
-                                    trail + [isLast])
+                                    trail + [isLast], n.id)
             }
         }
-        return walk(nodes, 0, false, false, [])
+        return walk(nodes, 0, false, false, [], nil)
     }
 
     /// 把 dragged 挂到 target 下面；target 为 nil 表示挪到根级。
@@ -232,20 +238,39 @@ enum Tree {
         return shape(a, 0) != shape(b, 0)
     }
 
-    /// 把节点挪到根级的第 index 个位置（index 是「插到谁前面」，等于 count 表示放末尾）。
-    /// 嵌套节点拖过来也走这里，等于同时出组 + 定位。
-    static func move(_ dragged: UUID, toRootIndex index: Int, in nodes: [Node]) -> [Node]? {
+    /// 把节点插到 parent 的第 index 个孩子的位置（index 是「插到谁前面」，等于 count 表示放末尾）。
+    /// parent 为 nil 表示根级。从别处拖过来的话，等于同时换爹 + 定位。
+    static func move(_ dragged: UUID, toIndex index: Int, under parent: UUID?,
+                     in nodes: [Node]) -> [Node]?
+    {
         var nodes = nodes
         guard let node = nodes.find(dragged) else { return nil }
-        let wasRootAt = nodes.firstIndex { $0.id == dragged }
-        nodes.detach(dragged)
-        // 原来就在根级且排在插入点前面的话，摘掉它之后后面的位置都往前挪了一格
+        if let parent {
+            if node.kind == .topic { return nil }        // 描述块只能待在根级
+            if node.contains(parent) { return nil }      // 不能插进自己的子树
+            guard nodes.find(parent) != nil else { return nil }
+        }
+        let siblings = parent.map { nodes.find($0)?.children ?? [] } ?? nodes
+        let wasAt = siblings.firstIndex { $0.id == dragged }
+        // 原来就在这一层、且排在插入点前面的话，摘掉它之后后面的位置都往前挪了一格
         var target = index
-        if let p = wasRootAt, p < index { target -= 1 }
-        target = max(0, min(target, nodes.count))
-        if wasRootAt == target { return nil }   // 没挪动，别白写一次盘
-        nodes.insert(node, at: target)
+        if let p = wasAt, p < index { target -= 1 }
+        target = max(0, min(target, siblings.count - (wasAt == nil ? 0 : 1)))
+        if wasAt == target { return nil }                // 没挪动，别白写一次盘
+
+        nodes.detach(dragged)
+        if let parent {
+            guard nodes.attach(node, under: parent, at: target) else { return nil }
+            nodes.update(parent) { $0.collapsed = false }   // 别让插进去的看起来「消失」了
+        } else {
+            nodes.insert(node, at: max(0, min(target, nodes.count)))
+        }
         return nodes
+    }
+
+    /// 根级排序，是上面那个的常用情形
+    static func move(_ dragged: UUID, toRootIndex index: Int, in nodes: [Node]) -> [Node]? {
+        move(dragged, toIndex: index, under: nil, in: nodes)
     }
 }
 
@@ -853,6 +878,14 @@ final class Model: ObservableObject {
     func moveProject(_ id: UUID, toIndex index: Int) {
         guard let moved = Store.moveProject(id, toIndex: index, in: store.projects) else { return }
         store.projects = moved
+        save()
+    }
+
+    func move(_ dragged: UUID, toIndex index: Int, under parent: UUID?) {
+        guard let i = projectIndex,
+              let moved = Tree.move(dragged, toIndex: index, under: parent,
+                                    in: store.projects[i].nodes) else { return }
+        store.projects[i].nodes = moved
         save()
     }
 
@@ -1598,15 +1631,17 @@ struct ContentView: View {
                     // 状态图例搬到设置里了：那是查一两次就记住的参照材料，
                     // 不该长期占着主界面一行；即时查询有徽标的悬停提示兜着
                     if m.editing { addBar.padding(.bottom, 6) }
-                    // 根级行之间插入投放缝，用来调整根级顺序；子行不需要（层级由父子决定）
+                    // 每一行前面都有一条投放缝，落进去就是「插到它前面、和它同一层」。
+                    // 子层同样需要 —— 同级的先后顺序在哪一层都该能调。
+                    // 排到某一层的**末尾**靠拖到父块身上（那本来就是「挂进去」的动作）。
                     ForEach(Array(m.rows.enumerated()), id: \.element.id) { _, row in
-                        if m.editing, row.depth == 0 {
-                            RootGap(index: rootIndex(before: row))
+                        if m.editing {
+                            RowGap(index: row.index, parent: row.parent, depth: row.depth)
                         }
                         NodeRow(row: row)
                     }
                     if m.editing, !(m.project?.nodes ?? []).isEmpty {
-                        RootGap(index: m.project?.nodes.count ?? 0)   // 末尾那条缝
+                        RowGap(index: m.project?.nodes.count ?? 0)   // 根级末尾那条缝
                     }
                     if (m.project?.nodes ?? []).isEmpty {
                         Text(m.editing
@@ -1621,11 +1656,6 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-    }
-
-    /// 这一行在根级数组里的下标（它是根级行时才有意义）
-    func rootIndex(before row: Row) -> Int {
-        m.project?.nodes.firstIndex { $0.id == row.node.id } ?? 0
     }
 
     var emptyProjects: some View {
@@ -2009,9 +2039,13 @@ struct SettingsView: View {
 
 /// 根级块之间的一条投放缝：平时几乎看不见，拖拽悬停时显示成插入线。
 /// 有它才能调整根级顺序 —— 落在块身上是「成为子块」，落在缝里才是「排到这个位置」。
-struct RootGap: View {
+/// 块与块之间的投放缝：插到这个位置，跟目标同一层。
+/// 根级和子层用的是同一个东西 —— 同层排序在哪一层都该能做。
+struct RowGap: View {
     @EnvironmentObject var m: Model
     let index: Int
+    var parent: UUID? = nil
+    var depth: Int = 0
     @State private var targeted = false
 
     var body: some View {
@@ -2025,10 +2059,11 @@ struct RootGap: View {
         }
         // 给足高度：这是拖拽落点，太窄不好瞄
         .frame(height: 14)
+        .padding(.leading, CGFloat(depth) * GuideCell.width)   // 缝跟着所在层缩进，落点才对得上
         .contentShape(Rectangle())
         .dropDestination(for: String.self) { items, _ in
             guard let id = items.first.flatMap(UUID.init) else { return false }
-            m.move(id, toRootIndex: index)
+            m.move(id, toIndex: index, under: parent)
             return true
         } isTargeted: { targeted = $0 }
     }
