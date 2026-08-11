@@ -379,14 +379,19 @@ enum Prefs {
     static let ghPath = "ghPath"                   // 自定义 gh 路径，空表示自动查找
     static let refreshInterval = "refreshInterval"  // 秒；0 表示只手动刷新
     static let autoImport = "autoImport"            // 自动把我的 open PR 导进来
+    static let autoCheckUpdate = "autoCheckUpdate"  // 启动时检查更新
+    static let autoInstallUpdate = "autoInstallUpdate"  // 查到就自动装（默认关）
 
     static func registerDefaults() {
-        UserDefaults.standard.register(defaults: [refreshInterval: 60, autoImport: true])
+        UserDefaults.standard.register(defaults: [
+            refreshInterval: 60, autoImport: true,
+            autoCheckUpdate: true, autoInstallUpdate: false,
+        ])
     }
 
-    static var autoImportOn: Bool {
-        UserDefaults.standard.bool(forKey: autoImport)
-    }
+    static var autoImportOn: Bool { UserDefaults.standard.bool(forKey: autoImport) }
+    static var autoCheckUpdateOn: Bool { UserDefaults.standard.bool(forKey: autoCheckUpdate) }
+    static var autoInstallUpdateOn: Bool { UserDefaults.standard.bool(forKey: autoInstallUpdate) }
 
     static var customGhPath: String {
         UserDefaults.standard.string(forKey: ghPath) ?? ""
@@ -557,6 +562,49 @@ enum PRStatus: CaseIterable {
     var isSettled: Bool { self == .merged || self == .closed }
 }
 
+// MARK: - 版本与自动更新
+
+enum Version {
+    /// 按数字逐段比较，不能用字符串比 —— "0.10.0" < "0.9.0" 是字符串序，是错的。
+    /// 段数不同时短的补 0，所以 "1.0" 和 "1.0.0" 相等。
+    static func compare(_ a: String, _ b: String) -> ComparisonResult {
+        let x = parts(a), y = parts(b)
+        for i in 0..<max(x.count, y.count) {
+            let l = i < x.count ? x[i] : 0
+            let r = i < y.count ? y[i] : 0
+            if l != r { return l < r ? .orderedAscending : .orderedDescending }
+        }
+        return .orderedSame
+    }
+
+    /// "v0.9.0" / "0.9.0" 都能吃；非数字段当 0
+    static func parts(_ s: String) -> [Int] {
+        s.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+            .split(separator: ".")
+            .map { Int($0.prefix { $0.isNumber }) ?? 0 }
+    }
+
+    static func isNewer(_ candidate: String, than current: String) -> Bool {
+        compare(candidate, current) == .orderedDescending
+    }
+}
+
+/// 查到的最新发布
+struct ReleaseInfo {
+    let version: String      // 去掉 v 前缀
+    let tag: String
+    let assetName: String
+}
+
+enum UpdateState: Equatable {
+    case idle
+    case checking
+    case upToDate            // 已经是最新
+    case available(String)   // 有新版本，带版本号
+    case downloading
+    case failed(String)
+}
+
 extension Optional where Wrapped == String {
     var isNilOrEmpty: Bool { self?.isEmpty ?? true }
 }
@@ -583,6 +631,10 @@ final class Model: ObservableObject {
     @Published var detecting = false
     @Published var installLog: [String] = []
     @Published var installing = false
+    // 自动更新
+    @Published var latest: ReleaseInfo?      // 查到的最新发布
+    @Published var updateState = UpdateState.idle
+    @Published var updateLog: [String] = []
 
     private var timer: Timer?
 
@@ -616,6 +668,9 @@ final class Model: ObservableObject {
         if store.selected == nil { store.selected = store.projects.first?.id }
         Task { await self.refresh() }
         Task { await self.detectToolchain() }
+        if Prefs.autoCheckUpdateOn {
+            Task { await self.checkForUpdate(auto: true) }
+        }
         rescheduleTimer()
     }
 
@@ -747,6 +802,47 @@ final class Model: ObservableObject {
         save()
     }
 
+    // MARK: 更新
+
+    var currentVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+    }
+
+    /// auto=true 表示是启动时自动查的：查不到就安静收场，别拿网络问题烦人
+    func checkForUpdate(auto: Bool = false) async {
+        if updateState == .checking || updateState == .downloading { return }
+        updateState = .checking
+        do {
+            let r = try await Self.fetchLatestRelease()
+            latest = r
+            if Version.isNewer(r.version, than: currentVersion) {
+                updateState = .available(r.version)
+                if Prefs.autoInstallUpdateOn { await installUpdate() }
+            } else {
+                updateState = .upToDate
+            }
+        } catch {
+            updateState = auto ? .idle : .failed(error.localizedDescription)
+        }
+    }
+
+    func installUpdate() async {
+        guard let r = latest, updateState != .downloading else { return }
+        updateState = .downloading
+        updateLog = []
+        do {
+            try await Self.downloadAndInstall(r) { [weak self] line in
+                Task { @MainActor in self?.updateLog.append(line) }
+            }
+            // 替换脚本已经在后台等着了，这里退出让它接手
+            updateLog.append("正在重启…")
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            NSApplication.shared.terminate(nil)
+        } catch {
+            updateState = .failed(error.localizedDescription)
+        }
+    }
+
     func deleteCurrentProject() {
         guard let i = projectIndex else { return }
         let gone = store.projects.remove(at: i).id
@@ -853,6 +949,110 @@ final class Model: ObservableObject {
             st.account = GhParse.account(from: out.stdout + "\n" + out.stderr)
         }
         return st
+    }
+
+    // MARK: 自动更新
+
+    static let repoSlug = "WloBy-Labs/PrWaiter"
+
+    /// 查最新发布。走 gh 而不是匿名 HTTP：GitHub 对未认证请求限 60 次/小时且按 IP 计，
+    /// 公司出口 IP 后面很容易撞上 403（实测就撞到过）；gh 带认证，限额 5000 次/小时。
+    /// 顺带也不用再引一套网络栈，仓库将来转 private 也不用改。
+    nonisolated static func fetchLatestRelease() async throws -> ReleaseInfo {
+        guard let gh = ghPath() else { throw AppError("找不到 GitHub CLI（gh）") }
+        let out = try await run(gh, ["release", "view", "--repo", repoSlug,
+                                     "--json", "tagName,assets"])
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any],
+              let tag = obj["tagName"] as? String
+        else {
+            throw AppError(out.stderr.isEmpty ? "查不到发布信息" : out.stderr)
+        }
+        let assets = (obj["assets"] as? [[String: Any]]) ?? []
+        guard let dmg = assets.compactMap({ $0["name"] as? String }).first(where: { $0.hasSuffix(".dmg") })
+        else {
+            throw AppError("最新发布 \(tag) 里没有 DMG")
+        }
+        return ReleaseInfo(version: tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV")),
+                           tag: tag, assetName: dmg)
+    }
+
+    /// 下载 → 校验签名 → 换掉自己 → 重启。
+    /// 换掉正在运行的自己没法在进程内完成，所以最后交给一个脱离出去的脚本：
+    /// 它等本进程退出后再替换并重新打开。
+    nonisolated static func downloadAndInstall(
+        _ release: ReleaseInfo, log: @escaping @Sendable (String) -> Void
+    ) async throws {
+        guard let gh = ghPath() else { throw AppError("找不到 GitHub CLI（gh）") }
+        let bundle = Bundle.main.bundleURL
+        guard bundle.pathExtension == "app" else {
+            throw AppError("当前不是从 .app 运行的，自动更新只在安装后的 App 上可用")
+        }
+        guard FileManager.default.isWritableFile(atPath: bundle.deletingLastPathComponent().path) else {
+            throw AppError("没有写入 \(bundle.deletingLastPathComponent().path) 的权限，请手动下载安装")
+        }
+
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("PrWaiterUpdate-\(release.tag)")
+        try? FileManager.default.removeItem(at: tmp)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+
+        log("下载 \(release.assetName)…")
+        let dl = try await run(gh, ["release", "download", release.tag, "--repo", repoSlug,
+                                    "--pattern", "*.dmg", "--dir", tmp.path])
+        let dmg = tmp.appendingPathComponent(release.assetName)
+        guard FileManager.default.fileExists(atPath: dmg.path) else {
+            throw AppError(dl.stderr.isEmpty ? "下载失败" : dl.stderr)
+        }
+
+        log("挂载并校验…")
+        let mountPoint = tmp.appendingPathComponent("mnt")
+        try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
+        let att = try await run("/usr/bin/hdiutil",
+                                ["attach", dmg.path, "-nobrowse", "-readonly",
+                                 "-mountpoint", mountPoint.path])
+        guard att.stderr.isEmpty || FileManager.default.fileExists(atPath: mountPoint.path) else {
+            throw AppError("挂载失败：\(att.stderr)")
+        }
+        let newApp = mountPoint.appendingPathComponent("PrWaiter.app")
+        guard FileManager.default.fileExists(atPath: newApp.path) else {
+            _ = try? await run("/usr/bin/hdiutil", ["detach", mountPoint.path, "-quiet"])
+            throw AppError("DMG 里没有 PrWaiter.app")
+        }
+
+        // 签名坏掉的包不能装进去 —— 下载可能损坏，装上就是个打不开的 App
+        let verify = try await run("/usr/bin/codesign", ["--verify", "--strict", newApp.path])
+        guard verify.stderr.range(of: "invalid|not signed", options: .regularExpression) == nil else {
+            _ = try? await run("/usr/bin/hdiutil", ["detach", mountPoint.path, "-quiet"])
+            throw AppError("下载到的包签名校验不通过，已中止：\(verify.stderr)")
+        }
+
+        // 先把新版拷到临时目录再卸载 DMG，免得替换脚本还依赖着挂载点
+        let staged = tmp.appendingPathComponent("PrWaiter.app")
+        try? FileManager.default.removeItem(at: staged)
+        try FileManager.default.copyItem(at: newApp, to: staged)
+        _ = try? await run("/usr/bin/hdiutil", ["detach", mountPoint.path, "-quiet"])
+
+        log("准备替换，App 将重启…")
+        let script = tmp.appendingPathComponent("swap.sh")
+        let body = """
+        #!/bin/bash
+        # 等本体退出后再替换，否则会覆盖正在运行的可执行文件
+        for _ in $(seq 1 100); do
+            kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null || break
+            sleep 0.2
+        done
+        rm -rf '\(bundle.path)'
+        cp -R '\(staged.path)' '\(bundle.path)'
+        open '\(bundle.path)'
+        rm -rf '\(tmp.path)'
+        """
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [script.path]
+        try p.run()   // 不 wait：它要活过本进程
     }
 
     /// 查当前 gh 账号在该仓库下所有 open 的 PR 编号。
@@ -1447,6 +1647,8 @@ struct SettingsView: View {
     @AppStorage(Prefs.ghPath) private var customPath = ""
     @AppStorage(Prefs.refreshInterval) private var interval = 60
     @AppStorage(Prefs.autoImport) private var autoImport = true
+    @AppStorage(Prefs.autoCheckUpdate) private var autoCheckUpdate = true
+    @AppStorage(Prefs.autoInstallUpdate) private var autoInstallUpdate = false
 
     static let intervals = [(30, "30 秒"), (60, "1 分钟"), (300, "5 分钟"), (0, "只手动刷新")]
 
@@ -1455,6 +1657,7 @@ struct SettingsView: View {
             ghSection
             statusSection
             refreshSection
+            updateSection
             aboutSection
         }
         .formStyle(.grouped)
@@ -1627,6 +1830,78 @@ struct SettingsView: View {
                  + "每个 PR 只导入一次：删掉之后不会再被导回来，已合并 / 已关闭的也不会被清走。")
             .font(.caption)
             .foregroundColor(.secondary)
+        }
+    }
+
+    // MARK: 更新
+
+    var updateSection: some View {
+        Section {
+            LabeledContent("当前版本") {
+                HStack(spacing: 10) {
+                    Text(verbatim: m.currentVersion)
+                    updateStatusLine
+                }
+            }
+            LabeledContent("操作") {
+                HStack(spacing: 8) {
+                    if case .available = m.updateState {
+                        Button {
+                            Task { await m.installUpdate() }
+                        } label: {
+                            Label("下载并安装", systemImage: "arrow.down.app")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(m.updateState == .downloading)
+                    }
+                    Button("检查更新") { Task { await m.checkForUpdate() } }
+                        .disabled(m.updateState == .checking || m.updateState == .downloading)
+                }
+            }
+            if !m.updateLog.isEmpty {
+                ForEach(Array(m.updateLog.enumerated()), id: \.offset) { _, line in
+                    Text(verbatim: line).font(.caption).foregroundColor(.secondary)
+                }
+            }
+            Toggle("启动时检查更新", isOn: $autoCheckUpdate)
+            Toggle("查到新版本就自动安装", isOn: $autoInstallUpdate)
+                .disabled(!autoCheckUpdate)
+        } header: {
+            Text("更新")
+        } footer: {
+            Text("更新走 gh 拉 Release —— 匿名 API 限 60 次/小时且按 IP 计，很容易撞上限额；"
+                 + "gh 带认证，限额高得多。"
+                 + "安装会校验下载包的签名，然后替换 /Applications 里的 App 并重启。\n"
+                 + "「自动安装」默认关：替换正在运行的 App 会让它重启，"
+                 + "这种事不该在你不知情时发生。")
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    var updateStatusLine: some View {
+        switch m.updateState {
+        case .idle:
+            EmptyView()
+        case .checking:
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.small)
+                Text("检查中…").foregroundColor(.secondary)
+            }
+        case .upToDate:
+            Label("已是最新", systemImage: "checkmark.circle.fill").foregroundColor(.green)
+        case .available(let v):
+            Label("有新版本 \(v)", systemImage: "arrow.up.circle.fill").foregroundColor(.orange)
+        case .downloading:
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.small)
+                Text("下载安装中…").foregroundColor(.secondary)
+            }
+        case .failed(let e):
+            Label(e, systemImage: "exclamationmark.triangle")
+                .foregroundColor(.red)
+                .lineLimit(2)
         }
     }
 
