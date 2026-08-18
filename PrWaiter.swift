@@ -577,9 +577,6 @@ struct LivePR {
     var url = ""
     var author = ""
     var base = ""       // 目标分支
-    /// check 明细，算 ci 用；分支保护的必过项要等第二轮才拿得到，所以先存着
-    var items: [CheckRollup.Item] = []
-    var suites: [String] = []
     var isDraft = false
     var review: String? // APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
@@ -1571,7 +1568,11 @@ final class Model: ObservableObject {
         return got
     }
 
-    /// 一次 GraphQL 请求拉完整个项目的 PR 状态
+    /// 拉完整个项目的 PR 状态。
+    ///
+    /// 分两趟：第一趟只要基本字段（便宜），第二趟只给**还开着的** PR 拉 check 明细。
+    /// check 明细很贵 —— 20 个 PR 能有 1300 多条 context、190 KB 响应。而已合并/已关闭的
+    /// PR 追究 CI 早就没意义了，状态已经是终局。全是老 PR 的项目直接省掉第二趟。
     nonisolated static func fetchLive(repo: String, numbers: Set<Int>) async throws -> [Int: LivePR] {
         guard let gh = ghPath() else {
             throw AppError("找不到 GitHub CLI（gh），到设置里可以一键安装")
@@ -1579,51 +1580,19 @@ final class Model: ObservableObject {
         guard repo.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil else {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
         }
-        let parts = repo.split(separator: "/")
-        // 不要 statusCheckRollup 那个 state —— 它算不准，见 CheckRollup 的注释。
-        // 自己把 contexts 和 check suite 拉下来算。
-        //
-        // contexts 用 last 不用 first：一页最多 100 条，而重跑过几轮的 PR 能到 120+
-        // （实测 StarRocks#77255 有 123 条）。要截也该截掉最老的那一批 ——
-        // 实测同一个 PR，last:100 覆盖到 71 个不同 check，first:100 只有 64 个。
-        let checks = """
-        statusCheckRollup { contexts(last: 100) { nodes { \
-          __typename \
-          ... on CheckRun { name status conclusion startedAt } \
-          ... on StatusContext { context state createdAt } \
-        } } } \
-        checkSuites(first: 50) { nodes { status } }
-        """
-        let fields = "number title state isDraft url reviewDecision baseRefName author { login } "
-            + "commits(last: 1) { nodes { commit { \(checks) } } }"
-        let aliases = numbers.sorted()
-            .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
-            .joined(separator: " ")
-        let query = "query { repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) } }"
 
-        let out = try await run(gh, ["api", "graphql", "-f", "query=\(query)"])
-        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
-            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
-        }
+        let basic = "number title state isDraft url reviewDecision baseRefName author { login }"
+        let (obj, repoData) = try await query(gh: gh, repo: repo, numbers: numbers, fields: basic)
 
         var live: [Int: LivePR] = [:]
-        let repoData = ((obj["data"] as? [String: Any])?["repository"] as? [String: Any]) ?? [:]
         for case let v as [String: Any] in Array(repoData.values) {
             guard let n = v["number"] as? Int else { continue }
-            let commit = ((v["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
-                .first?["commit"] as? [String: Any]
-            let rollup = commit?["statusCheckRollup"] as? [String: Any]
-            let contexts = (rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
-            let suites = (commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
             var lv = LivePR()
             lv.title = v["title"] as? String ?? ""
             lv.state = v["state"] as? String ?? ""
             lv.isDraft = v["isDraft"] as? Bool ?? false
             lv.url = v["url"] as? String ?? ""
             lv.review = v["reviewDecision"] as? String
-            lv.items = contexts.map(CheckRollup.Item.init(json:))
-            lv.suites = suites.compactMap { $0["status"] as? String }
-            lv.ci = CheckRollup.state(contexts: lv.items, suites: lv.suites)
             lv.author = (v["author"] as? [String: Any])?["login"] as? String ?? ""
             lv.base = v["baseRefName"] as? String ?? ""
             live[n] = lv
@@ -1634,9 +1603,12 @@ final class Model: ObservableObject {
             throw AppError(msg)
         }
 
-        // 再把分支保护的必过项算进去。只管还开着的 PR —— 已合并/已关闭的
-        // 追究「当初有没有跑完」没意义，而且老 commit 多半缺几项，会永远显示在跑。
-        let branches = Set(live.values.filter { $0.state == "OPEN" && !$0.base.isEmpty }.map(\.base))
+        let open = Set(live.filter { $0.value.state == "OPEN" }.keys)
+        guard !open.isEmpty else { return live }
+
+        // 第二趟：只给开着的 PR 拉 check 明细，同时按目标分支查必过项清单
+        async let checks = openChecks(gh: gh, repo: repo, numbers: open)
+        let branches = Set(open.compactMap { live[$0]?.base }.filter { !$0.isEmpty })
         var required: [String: Set<String>] = [:]
         await withTaskGroup(of: (String, Set<String>).self) { group in
             for b in branches {
@@ -1644,11 +1616,63 @@ final class Model: ObservableObject {
             }
             for await (b, r) in group { required[b] = r }
         }
-        for (n, lv) in live where lv.state == "OPEN" {
-            live[n]?.ci = CheckRollup.state(contexts: lv.items, suites: lv.suites,
-                                            required: required[lv.base] ?? [])
+        for (n, parsed) in await checks {
+            let base = live[n]?.base ?? ""
+            live[n]?.ci = CheckRollup.state(contexts: parsed.items, suites: parsed.suites,
+                                            required: required[base] ?? [])
         }
         return live
+    }
+
+    /// 把编号拼成一次带别名的查询，返回整个响应和 repository 那一层
+    private nonisolated static func query(
+        gh: String, repo: String, numbers: Set<Int>, fields: String
+    ) async throws -> ([String: Any], [String: Any]) {
+        let parts = repo.split(separator: "/")
+        let aliases = numbers.sorted()
+            .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
+            .joined(separator: " ")
+        let q = "query { repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) } }"
+        let out = try await run(gh, ["api", "graphql", "-f", "query=\(q)"])
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
+            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
+        }
+        return (obj, ((obj["data"] as? [String: Any])?["repository"] as? [String: Any]) ?? [:])
+    }
+
+    /// 开着的 PR 的 check 明细。
+    ///
+    /// 不要 statusCheckRollup 那个 state —— 它算不准，见 CheckRollup 的注释，自己按明细算。
+    /// contexts 用 last 不用 first：一页最多 100 条，而重跑过几轮的 PR 能到 120+
+    /// （实测 StarRocks#77255 有 123 条）。要截也该截掉最老的那一批 ——
+    /// 实测同一个 PR，last:100 覆盖到 71 个不同 check，first:100 只有 64 个。
+    private nonisolated static func openChecks(
+        gh: String, repo: String, numbers: Set<Int>
+    ) async -> [Int: (items: [CheckRollup.Item], suites: [String])] {
+        let fields = """
+        number commits(last: 1) { nodes { commit { \
+          statusCheckRollup { contexts(last: 100) { nodes { \
+            __typename \
+            ... on CheckRun { name status conclusion startedAt } \
+            ... on StatusContext { context state createdAt } \
+          } } } \
+          checkSuites(first: 50) { nodes { status } } } } }
+        """
+        guard let (_, repoData) = try? await query(gh: gh, repo: repo, numbers: numbers, fields: fields)
+        else { return [:] }
+
+        var out: [Int: (items: [CheckRollup.Item], suites: [String])] = [:]
+        for case let v as [String: Any] in Array(repoData.values) {
+            guard let n = v["number"] as? Int else { continue }
+            let commit = ((v["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
+                .first?["commit"] as? [String: Any]
+            let rollup = commit?["statusCheckRollup"] as? [String: Any]
+            let contexts = (rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+            let suites = (commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+            out[n] = (contexts.map(CheckRollup.Item.init(json:)),
+                      suites.compactMap { $0["status"] as? String })
+        }
+        return out
     }
 
     /// 边跑边把输出一行行吐出来，装 gh 时用（brew 可能要跑好几分钟，不能干等）

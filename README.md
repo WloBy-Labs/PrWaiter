@@ -140,6 +140,9 @@ CI 那一列是 PrWaiter 自己算的，不是直接读 GitHub 的 `statusCheckR
 同名 check 的历次尝试都算进去（重跑绿了旧的红还挂着），而且只看已经报上来的。算法是：
 同名只取最新一次尝试；有失败就是失败；有任何一项在跑就是「运行中」。
 
+check 明细只给**还开着的** PR 拉（刷新分两趟，第一趟只要基本字段），所以
+已合并 / 已关闭的行不显示 CI 徽标 —— 它们的状态已经是终局，CI 结论没有意义。
+
 还会额外查一次**分支保护的必过项**（`protection.required_status_checks.contexts`，只要读权限
 就能读），比对下来缺哪怕一项没报上来，就算「运行中」—— 这对应 GitHub 界面上的
 「Expected — Waiting for status to be reported」。这些项不在任何 check 接口里，
