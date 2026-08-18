@@ -24,6 +24,7 @@ struct Tests {
         importOrderTests()
         reparentTests()
         projectReorderTests()
+        checkRollupTests()
         statusTests()
         migrationTests()
         codableTests()
@@ -621,6 +622,79 @@ struct Tests {
 
         // 拉不到标题时不猜
         check(Tree.reparenting([trunk], titles: [:]) == nil, "没有标题就不动")
+    }
+
+    static func checkRollupTests() {
+        print("CI 结论自己算:")
+
+        func run(_ name: String, _ state: String, _ at: String = "2026-01-01T00:00:00Z") -> CheckRollup.Item {
+            CheckRollup.Item(name: name, state: state, at: at)
+        }
+
+        // --- 基本分档 ---
+        check(CheckRollup.state(contexts: [run("a", "SUCCESS")], suites: ["COMPLETED"]) == "SUCCESS",
+              "全绿就是通过")
+        check(CheckRollup.state(contexts: [run("a", "SUCCESS"), run("b", "FAILURE")],
+                                suites: ["COMPLETED"]) == "FAILURE", "有一个红就是红")
+        check(CheckRollup.state(contexts: [run("a", "SUCCESS"), run("b", "IN_PROGRESS")],
+                                suites: ["COMPLETED"]) == "PENDING", "还有在跑的就是在跑")
+        check(CheckRollup.state(contexts: [run("a", "SKIPPED"), run("b", "NEUTRAL")],
+                                suites: ["COMPLETED"]) == "SUCCESS", "跳过和 neutral 不算失败")
+        check(CheckRollup.state(contexts: [run("a", "FAILURE"), run("b", "QUEUED")],
+                                suites: ["COMPLETED"]) == "FAILURE", "红优先于在跑 —— 已经该你动手了")
+
+        // --- 没有 CI 的仓库：unknown，不是「通过」 ---
+        check(CheckRollup.state(contexts: [], suites: []) == nil, "一条 check 都没有时是 unknown")
+
+        // --- 关键一条：有 suite 在跑，就别说通过 ---
+        // 刚推完代码，跑得快的先报绿，重活还在跑 —— 这正是「CI 没跑完却显示通过」
+        check(CheckRollup.state(contexts: [run("title-check", "SUCCESS")],
+                                suites: ["COMPLETED", "IN_PROGRESS"]) == "PENDING",
+              "还有 suite 在跑时不算通过，哪怕已报上来的全绿")
+
+        // 但 QUEUED 不能算 —— 仓库上装的每个 GitHub App 都会挂一个 suite，
+        // 多数一条 check run 都不发，永远停在 QUEUED。实测 StarRocks 每个 commit
+        // 都挂着 5 个这样的空 suite，认 QUEUED 的话早就合并的 PR 会永远显示「CI 运行中」
+        check(CheckRollup.state(contexts: [run("a", "SUCCESS")],
+                                suites: ["COMPLETED", "QUEUED"]) == "SUCCESS",
+              "空转的 QUEUED suite 不算在跑（装了 App 就会有，永远不完成）")
+        check(CheckRollup.state(contexts: [], suites: ["QUEUED"]) == nil,
+              "只有空 suite、一条 check 都没有，是 unknown")
+
+        // --- 另一条关键：同名多次尝试只算最新的 ---
+        // 实测 60611：54 条 context 去重后只剩 34 项，20 个名字各有两次尝试；
+        // 旧的那次 FAILURE 会把 GitHub 的 rollup 带成 FAILURE
+        let retried = [
+            run("backport-check", "FAILURE", "2026-08-17T11:40:00Z"),
+            run("backport-check", "SUCCESS", "2026-08-17T12:10:00Z"),
+        ]
+        check(CheckRollup.state(contexts: retried, suites: ["COMPLETED"]) == "SUCCESS",
+              "重跑绿了就是绿了，旧的那条红不算数")
+        check(CheckRollup.state(contexts: retried.reversed(), suites: ["COMPLETED"]) == "SUCCESS",
+              "跟 GitHub 返回的先后顺序无关，看时间戳")
+        let regressed = [
+            run("BUILD", "SUCCESS", "2026-08-17T11:40:00Z"),
+            run("BUILD", "FAILURE", "2026-08-17T12:10:00Z"),
+        ]
+        check(CheckRollup.state(contexts: regressed, suites: ["COMPLETED"]) == "FAILURE",
+              "反过来也认：重跑挂了就是挂了")
+
+        // --- 解析 GraphQL 两种节点 ---
+        let cr = CheckRollup.Item(json: ["name": "BUILD", "status": "COMPLETED",
+                                         "conclusion": "SUCCESS", "startedAt": "2026-08-17T11:00:00Z"])
+        check(cr.name == "BUILD" && cr.state == "SUCCESS", "CheckRun 优先取 conclusion")
+        let running = CheckRollup.Item(json: ["name": "BUILD", "status": "IN_PROGRESS",
+                                              "conclusion": NSNull(), "startedAt": ""])
+        check(running.state == "IN_PROGRESS", "还没跑完时 conclusion 是空的，得看 status")
+        let sc = CheckRollup.Item(json: ["context": "ci/jenkins", "state": "PENDING",
+                                         "createdAt": "2026-08-17T11:00:00Z"])
+        check(sc.name == "ci/jenkins" && sc.state == "PENDING", "老式 StatusContext 也认")
+
+        // --- 接到 classify 上，界面才会变 ---
+        var lv = LivePR(); lv.state = "OPEN"; lv.review = "APPROVED"
+        lv.ci = CheckRollup.state(contexts: [run("fast", "SUCCESS")], suites: ["IN_PROGRESS"])
+        check(Model.classify(lv, blocked: false) == .ciRunning,
+              "已批准但 CI 还在跑，显示的是「CI 运行中」而不是「可合并」")
     }
 
     static func statusTests() {

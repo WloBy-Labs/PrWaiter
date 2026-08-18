@@ -582,6 +582,77 @@ struct LivePR {
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
 }
 
+/// 从 check 明细自己算 CI 结论。
+///
+/// 为什么不直接用 GitHub 的 `statusCheckRollup.state`：它算不准，而且**取决于你怎么问**。
+/// 同一个 commit、同一时刻，实测：
+///
+///     statusCheckRollup { state }                      -> SUCCESS
+///     statusCheckRollup { state contexts(first:100) }   -> FAILURE
+///
+/// 原因是它把**同名 check 的历次尝试**全算进去了：一个 check 失败后重跑成功，
+/// 旧的那条 FAILURE 还挂在 commit 上。实测某个 PR 有 54 条 context，
+/// 按名字去重之后只有 34 项，20 个名字各有两次尝试。
+///
+/// 还有一条更要命的：rollup 只看**已经报上来的**。刚推完代码时，
+/// 跑得快的几个（title-check、lint 之类）先报 SUCCESS，重活还没报上来，
+/// 于是 rollup 就是 SUCCESS —— 界面上显示「CI ✓」，其实正经 job 还在跑。
+/// 所以这里额外看 check suite：有 suite 正在跑，就算 CI 还在跑。
+///
+/// **只认 IN_PROGRESS，不认 QUEUED。** 装在仓库上的每个 GitHub App 都会给每个 commit
+/// 挂一个 check suite，而多数 App 一条 check run 都不会发 —— 那些 suite 就永远停在
+/// QUEUED。实测 StarRocks 每个 commit 都挂着 5 个这样的空 suite
+/// （sonarqubecloud、codecov、vercel、claude、cursor），把 QUEUED 也算成「在跑」的话，
+/// 20 个 PR 里有 9 个（全是早就合并/关闭的）会永远显示「CI 运行中」。
+enum CheckRollup {
+    /// 一条 check 记录，CheckRun 和老式 StatusContext 归一化成同一个形状
+    struct Item {
+        let name: String
+        let state: String
+        let at: String      // ISO8601，同名取最新的那次
+
+        init(name: String, state: String, at: String) {
+            self.name = name
+            self.state = state
+            self.at = at
+        }
+
+        init(json: [String: Any]) {
+            if let n = json["name"] as? String {          // CheckRun
+                name = n
+                // 没跑完时 conclusion 是 null，这时候 status 才是有效信息
+                state = (json["conclusion"] as? String) ?? (json["status"] as? String) ?? ""
+                at = json["startedAt"] as? String ?? ""
+            } else {                                       // StatusContext
+                name = json["context"] as? String ?? ""
+                state = json["state"] as? String ?? ""
+                at = json["createdAt"] as? String ?? ""
+            }
+        }
+    }
+
+    static let pending: Set<String> = ["QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING", "EXPECTED"]
+    static let failed: Set<String> = ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]
+
+    /// nil 表示这个 PR 压根没有 CI（有些仓库就是没配），不是「通过」
+    static func state(contexts: [Item], suites: [String]) -> String? {
+        // 有 suite 正在跑，说明重活还没报完，先说在跑
+        if suites.contains("IN_PROGRESS") { return "PENDING" }
+        guard !contexts.isEmpty else { return nil }
+
+        // 同名只留最新一次尝试 —— 重跑绿了就是绿了，旧的那条红不算数
+        var latest: [String: Item] = [:]
+        for c in contexts where !c.name.isEmpty {
+            if let old = latest[c.name], old.at > c.at { continue }
+            latest[c.name] = c
+        }
+        let states = latest.values.map(\.state)
+        if states.contains(where: { failed.contains($0) }) { return "FAILURE" }
+        if states.contains(where: { pending.contains($0) }) { return "PENDING" }
+        return states.isEmpty ? nil : "SUCCESS"
+    }
+}
+
 /// 每个 PR 落在且只落在一个状态里，所以描述块上的分项计数加起来正好等于 PR 总数。
 /// 顺序即优先级：先「该你动手的」，再「等上游」，再「等别人/等机器」，最后才是可以合了。
 enum PRStatus: CaseIterable {
@@ -1468,8 +1539,22 @@ final class Model: ObservableObject {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
         }
         let parts = repo.split(separator: "/")
+        // 不要 statusCheckRollup 那个 state —— 它算不准，见 CheckRollup 的注释。
+        // 自己把 contexts 和 check suite 拉下来算。
+        //
+        // contexts 用 last 不用 first：一页最多 100 条，而重跑过几轮的 PR 能到 120+
+        // （实测 StarRocks#77255 有 123 条）。要截也该截掉最老的那一批 ——
+        // 实测同一个 PR，last:100 覆盖到 71 个不同 check，first:100 只有 64 个。
+        let checks = """
+        statusCheckRollup { contexts(last: 100) { nodes { \
+          __typename \
+          ... on CheckRun { name status conclusion startedAt } \
+          ... on StatusContext { context state createdAt } \
+        } } } \
+        checkSuites(first: 50) { nodes { status } }
+        """
         let fields = "number title state isDraft url reviewDecision baseRefName author { login } "
-            + "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
+            + "commits(last: 1) { nodes { commit { \(checks) } } }"
         let aliases = numbers.sorted()
             .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
             .joined(separator: " ")
@@ -1487,13 +1572,16 @@ final class Model: ObservableObject {
             let commit = ((v["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
                 .first?["commit"] as? [String: Any]
             let rollup = commit?["statusCheckRollup"] as? [String: Any]
+            let contexts = (rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+            let suites = (commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
             var lv = LivePR()
             lv.title = v["title"] as? String ?? ""
             lv.state = v["state"] as? String ?? ""
             lv.isDraft = v["isDraft"] as? Bool ?? false
             lv.url = v["url"] as? String ?? ""
             lv.review = v["reviewDecision"] as? String
-            lv.ci = rollup?["state"] as? String
+            lv.ci = CheckRollup.state(contexts: contexts.map(CheckRollup.Item.init(json:)),
+                                      suites: suites.compactMap { $0["status"] as? String })
             lv.author = (v["author"] as? [String: Any])?["login"] as? String ?? ""
             lv.base = v["baseRefName"] as? String ?? ""
             live[n] = lv

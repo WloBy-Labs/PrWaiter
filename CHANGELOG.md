@@ -10,6 +10,31 @@
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-18
+
+### Fixed
+
+- **CI 状态不再直接信 GitHub 的 `statusCheckRollup.state`，改成自己按 check 明细算。**
+  那个字段算不准，而且**取决于你怎么问** —— 同一个 commit、同一时刻，实测各查 4 次：
+
+  ```
+  statusCheckRollup { state }                     -> SUCCESS SUCCESS SUCCESS SUCCESS
+  statusCheckRollup { state contexts(first:100) } -> FAILURE FAILURE FAILURE FAILURE
+  ```
+
+  两条原因：一是它把**同名 check 的历次尝试**都算进去，某个 check 失败后重跑成功，
+  旧那条 FAILURE 还挂在 commit 上（实测某 PR 54 条 context，按名字去重只剩 34 项）；
+  二是它只看**已经报上来的**，跑得快的 lint 先报绿、重活还在跑时，它就已经说通过了 ——
+  这就是「CI 明明没跑完，界面显示 CI 通过」。
+
+  现在的算法：同名只取最新一次尝试；任一项失败就是失败；有任何一项在跑、
+  或有 check suite 处于 IN_PROGRESS，就是「运行中」；一条 check 都没有是未知，**不是通过**。
+  拿 15 个最近更新的 open PR 对过，5 个的结论和那个字段不一样，且都是新算法对。
+
+  **只认 IN_PROGRESS 的 suite，不认 QUEUED**：仓库上装的每个 GitHub App 都会给每个 commit
+  挂一个 suite，多数一条 check run 都不发，永远停在 QUEUED（实测 StarRocks 每个 commit 挂着
+  5 个这样的空 suite）。认 QUEUED 的话，早就合并的 PR 会永远显示「CI 运行中」。
+
 ## [1.0.0] - 2026-08-11
 
 到这一版为止，一个新用户拿到 App 之后不用问人也能把它用起来 —— 这是 1.0.0 的门槛。
