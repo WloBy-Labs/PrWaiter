@@ -10,6 +10,51 @@
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-18
+
+### Fixed
+
+- **CI 明明没跑完，界面显示「CI ✓」。** 两个独立的原因，都修了。
+
+  **一、分支保护要求的必过项，从来没报上来过。** GitHub 界面上那条
+  「Some checks haven't completed yet — 8 expected」「Expected — Waiting for status to be reported」，
+  指的是分支保护里配了必过、但这个 commit 上一次都没出现过的 check。它们不是 check run、
+  不是 check suite、也不是 status context —— **所有 check 接口都看不见它们**，
+  连 `gh pr checks` 都看不见（它只会说 19 pass / 23 skipping）。
+
+  现在多拉一次 `repos/{repo}/branches/{分支}`，从 `protection.required_status_checks.contexts`
+  拿到必过项清单，跟已报上来的比对，缺哪怕一项就是「运行中」。这个接口**只要读权限**就能读
+  （实测 `admin=false`、`push=false` 也读得到），比要 admin 的 `/branches/{b}/protection` 宽松。
+  实测某 PR：要求 14 项、报上来 34 个 check、缺 8 项 —— 跟界面上那个 8 一模一样。
+  只对**还开着的** PR 做这个判断，已合并/关闭的追究这个没意义。
+
+  **二、不再直接信 `statusCheckRollup.state`。** 那个字段算不准，而且**取决于你怎么问** ——
+  同一个 commit、同一时刻，各查 4 次：
+
+  ```
+  statusCheckRollup { state }                     -> SUCCESS SUCCESS SUCCESS SUCCESS
+  statusCheckRollup { state contexts(first:100) } -> FAILURE FAILURE FAILURE FAILURE
+  ```
+
+  因为它把**同名 check 的历次尝试**都算进去了：某项失败后重跑成功，旧那条 FAILURE
+  还挂在 commit 上（实测某 PR 54 条 context，按名字去重只剩 34 项）。现在同名只取最新一次尝试。
+
+  **只认 IN_PROGRESS 的 check suite，不认 QUEUED**：仓库上装的每个 GitHub App 都会给每个
+  commit 挂一个 suite，多数一条 check run 都不发，永远停在 QUEUED（实测 StarRocks 每个 commit
+  挂着 5 个这样的空 suite）。认 QUEUED 的话，早就合并的 PR 会永远显示「CI 运行中」。
+
+### Changed
+
+- **check 明细只给还开着的 PR 拉。** 刷新分两趟：第一趟只要基本字段（便宜），
+  第二趟才给 open 的 PR 拉 check 明细和必过项清单。check 明细很贵 ——
+  20 个 PR 能有 1300 多条 context、190 KB 响应，而已合并/已关闭的 PR 追究 CI 早就没意义了。
+  实测一个 20 个 PR 全是已合并/关闭的项目，第二趟直接跳过，刷新只要 ~2 秒。
+
+  副作用：**已合并 / 已关闭的行不再显示 CI 徽标**。那本来也是噪音 ——
+  状态已经是终局，而且旧尝试留下的假红经常挂在上面。
+
+  必过项清单按 `repo@分支` 缓存到进程退出，同一个分支只查一次。
+
 ## [1.0.0] - 2026-08-11
 
 到这一版为止，一个新用户拿到 App 之后不用问人也能把它用起来 —— 这是 1.0.0 的门槛。

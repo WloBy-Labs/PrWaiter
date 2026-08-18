@@ -582,6 +582,95 @@ struct LivePR {
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
 }
 
+/// 从 check 明细自己算 CI 结论。
+///
+/// 为什么不直接用 GitHub 的 `statusCheckRollup.state`：它算不准，而且**取决于你怎么问**。
+/// 同一个 commit、同一时刻，实测：
+///
+///     statusCheckRollup { state }                      -> SUCCESS
+///     statusCheckRollup { state contexts(first:100) }   -> FAILURE
+///
+/// 原因是它把**同名 check 的历次尝试**全算进去了：一个 check 失败后重跑成功，
+/// 旧的那条 FAILURE 还挂在 commit 上。实测某个 PR 有 54 条 context，
+/// 按名字去重之后只有 34 项，20 个名字各有两次尝试。
+///
+/// 还有一条更要命的：rollup 只看**已经报上来的**。刚推完代码时，
+/// 跑得快的几个（title-check、lint 之类）先报 SUCCESS，重活还没报上来，
+/// 于是 rollup 就是 SUCCESS —— 界面上显示「CI ✓」，其实正经 job 还在跑。
+/// 所以这里额外看 check suite：有 suite 正在跑，就算 CI 还在跑。
+///
+/// **只认 IN_PROGRESS，不认 QUEUED。** 装在仓库上的每个 GitHub App 都会给每个 commit
+/// 挂一个 check suite，而多数 App 一条 check run 都不会发 —— 那些 suite 就永远停在
+/// QUEUED。实测 StarRocks 每个 commit 都挂着 5 个这样的空 suite
+/// （sonarqubecloud、codecov、vercel、claude、cursor），把 QUEUED 也算成「在跑」的话，
+/// 20 个 PR 里有 9 个（全是早就合并/关闭的）会永远显示「CI 运行中」。
+enum CheckRollup {
+    /// 一条 check 记录，CheckRun 和老式 StatusContext 归一化成同一个形状
+    struct Item {
+        let name: String
+        let state: String
+        let at: String      // ISO8601，同名取最新的那次
+
+        init(name: String, state: String, at: String) {
+            self.name = name
+            self.state = state
+            self.at = at
+        }
+
+        init(json: [String: Any]) {
+            if let n = json["name"] as? String {          // CheckRun
+                name = n
+                // 没跑完时 conclusion 是 null，这时候 status 才是有效信息
+                state = (json["conclusion"] as? String) ?? (json["status"] as? String) ?? ""
+                at = json["startedAt"] as? String ?? ""
+            } else {                                       // StatusContext
+                name = json["context"] as? String ?? ""
+                state = json["state"] as? String ?? ""
+                at = json["createdAt"] as? String ?? ""
+            }
+        }
+    }
+
+    static let pending: Set<String> = ["QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING", "EXPECTED"]
+    static let failed: Set<String> = ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]
+
+    /// - required: 分支保护要求的必过项。**这些里面有一项从来没报上来，CI 就没跑完** ——
+    ///   GitHub 界面上那一条「Expected — Waiting for status to be reported」就是它。
+    ///   传空集表示不知道（拿不到分支保护，或者这个分支没保护），那就只按已报上来的算。
+    ///
+    /// nil 表示这个 PR 压根没有 CI（有些仓库就是没配），不是「通过」
+    static func state(contexts: [Item], suites: [String], required: Set<String> = []) -> String? {
+        // 有 suite 正在跑，说明重活还没报完，先说在跑
+        if suites.contains("IN_PROGRESS") { return "PENDING" }
+
+        // 同名只留最新一次尝试 —— 重跑绿了就是绿了，旧的那条红不算数
+        var latest: [String: Item] = [:]
+        for c in contexts where !c.name.isEmpty {
+            if let old = latest[c.name], old.at > c.at { continue }
+            latest[c.name] = c
+        }
+        let states = latest.values.map(\.state)
+
+        // 失败排在最前：已经该你动手了，别的还在跑不改变这一点
+        if states.contains(where: { failed.contains($0) }) { return "FAILURE" }
+        if states.contains(where: { pending.contains($0) }) { return "PENDING" }
+        // 必过项一个都没露面 —— 界面上显示 Expected，压根还没轮到它跑
+        if !required.isSubset(of: Set(latest.keys)) { return "PENDING" }
+        return states.isEmpty ? nil : "SUCCESS"
+    }
+
+    /// 从 `repos/{repo}/branches/{branch}` 的响应里挖出必过项清单。
+    /// 只要读权限就能拿到（实测 admin=false、push=false 也读得到），
+    /// 比 `branches/{b}/protection` 那个要 admin 的接口宽松得多。
+    static func requiredContexts(fromBranchJSON data: Data) -> Set<String> {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let prot = obj["protection"] as? [String: Any],
+              let rsc = prot["required_status_checks"] as? [String: Any],
+              let list = rsc["contexts"] as? [String] else { return [] }
+        return Set(list)
+    }
+}
+
 /// 每个 PR 落在且只落在一个状态里，所以描述块上的分项计数加起来正好等于 PR 总数。
 /// 顺序即优先级：先「该你动手的」，再「等上游」，再「等别人/等机器」，最后才是可以合了。
 enum PRStatus: CaseIterable {
@@ -1459,7 +1548,31 @@ final class Model: ObservableObject {
         }
     }
 
-    /// 一次 GraphQL 请求拉完整个项目的 PR 状态
+    /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，
+    /// 每次刷新都去问一遍纯属浪费。缓存活到进程退出。
+    private final class RequiredCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var map: [String: Set<String>] = [:]
+        func get(_ k: String) -> Set<String>? { lock.lock(); defer { lock.unlock() }; return map[k] }
+        func put(_ k: String, _ v: Set<String>) { lock.lock(); defer { lock.unlock() }; map[k] = v }
+    }
+    private static let requiredCache = RequiredCache()
+
+    /// 某个分支要求哪些 check 必过。拿不到就返回空集（当作不知道，别瞎猜）
+    nonisolated static func requiredChecks(gh: String, repo: String, branch: String) async -> Set<String> {
+        let key = "\(repo)@\(branch)"
+        if let hit = requiredCache.get(key) { return hit }
+        guard let out = try? await run(gh, ["api", "repos/\(repo)/branches/\(branch)"]) else { return [] }
+        let got = CheckRollup.requiredContexts(fromBranchJSON: Data(out.stdout.utf8))
+        requiredCache.put(key, got)
+        return got
+    }
+
+    /// 拉完整个项目的 PR 状态。
+    ///
+    /// 分两趟：第一趟只要基本字段（便宜），第二趟只给**还开着的** PR 拉 check 明细。
+    /// check 明细很贵 —— 20 个 PR 能有 1300 多条 context、190 KB 响应。而已合并/已关闭的
+    /// PR 追究 CI 早就没意义了，状态已经是终局。全是老 PR 的项目直接省掉第二趟。
     nonisolated static func fetchLive(repo: String, numbers: Set<Int>) async throws -> [Int: LivePR] {
         guard let gh = ghPath() else {
             throw AppError("找不到 GitHub CLI（gh），到设置里可以一键安装")
@@ -1467,33 +1580,19 @@ final class Model: ObservableObject {
         guard repo.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil else {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
         }
-        let parts = repo.split(separator: "/")
-        let fields = "number title state isDraft url reviewDecision baseRefName author { login } "
-            + "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
-        let aliases = numbers.sorted()
-            .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
-            .joined(separator: " ")
-        let query = "query { repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) } }"
 
-        let out = try await run(gh, ["api", "graphql", "-f", "query=\(query)"])
-        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
-            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
-        }
+        let basic = "number title state isDraft url reviewDecision baseRefName author { login }"
+        let (obj, repoData) = try await query(gh: gh, repo: repo, numbers: numbers, fields: basic)
 
         var live: [Int: LivePR] = [:]
-        let repoData = ((obj["data"] as? [String: Any])?["repository"] as? [String: Any]) ?? [:]
         for case let v as [String: Any] in Array(repoData.values) {
             guard let n = v["number"] as? Int else { continue }
-            let commit = ((v["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
-                .first?["commit"] as? [String: Any]
-            let rollup = commit?["statusCheckRollup"] as? [String: Any]
             var lv = LivePR()
             lv.title = v["title"] as? String ?? ""
             lv.state = v["state"] as? String ?? ""
             lv.isDraft = v["isDraft"] as? Bool ?? false
             lv.url = v["url"] as? String ?? ""
             lv.review = v["reviewDecision"] as? String
-            lv.ci = rollup?["state"] as? String
             lv.author = (v["author"] as? [String: Any])?["login"] as? String ?? ""
             lv.base = v["baseRefName"] as? String ?? ""
             live[n] = lv
@@ -1503,7 +1602,77 @@ final class Model: ObservableObject {
            let msg = errs.first?["message"] as? String {
             throw AppError(msg)
         }
+
+        let open = Set(live.filter { $0.value.state == "OPEN" }.keys)
+        guard !open.isEmpty else { return live }
+
+        // 第二趟：只给开着的 PR 拉 check 明细，同时按目标分支查必过项清单
+        async let checks = openChecks(gh: gh, repo: repo, numbers: open)
+        let branches = Set(open.compactMap { live[$0]?.base }.filter { !$0.isEmpty })
+        var required: [String: Set<String>] = [:]
+        await withTaskGroup(of: (String, Set<String>).self) { group in
+            for b in branches {
+                group.addTask { (b, await requiredChecks(gh: gh, repo: repo, branch: b)) }
+            }
+            for await (b, r) in group { required[b] = r }
+        }
+        for (n, parsed) in await checks {
+            let base = live[n]?.base ?? ""
+            live[n]?.ci = CheckRollup.state(contexts: parsed.items, suites: parsed.suites,
+                                            required: required[base] ?? [])
+        }
         return live
+    }
+
+    /// 把编号拼成一次带别名的查询，返回整个响应和 repository 那一层
+    private nonisolated static func query(
+        gh: String, repo: String, numbers: Set<Int>, fields: String
+    ) async throws -> ([String: Any], [String: Any]) {
+        let parts = repo.split(separator: "/")
+        let aliases = numbers.sorted()
+            .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
+            .joined(separator: " ")
+        let q = "query { repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) } }"
+        let out = try await run(gh, ["api", "graphql", "-f", "query=\(q)"])
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
+            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
+        }
+        return (obj, ((obj["data"] as? [String: Any])?["repository"] as? [String: Any]) ?? [:])
+    }
+
+    /// 开着的 PR 的 check 明细。
+    ///
+    /// 不要 statusCheckRollup 那个 state —— 它算不准，见 CheckRollup 的注释，自己按明细算。
+    /// contexts 用 last 不用 first：一页最多 100 条，而重跑过几轮的 PR 能到 120+
+    /// （实测 StarRocks#77255 有 123 条）。要截也该截掉最老的那一批 ——
+    /// 实测同一个 PR，last:100 覆盖到 71 个不同 check，first:100 只有 64 个。
+    private nonisolated static func openChecks(
+        gh: String, repo: String, numbers: Set<Int>
+    ) async -> [Int: (items: [CheckRollup.Item], suites: [String])] {
+        let fields = """
+        number commits(last: 1) { nodes { commit { \
+          statusCheckRollup { contexts(last: 100) { nodes { \
+            __typename \
+            ... on CheckRun { name status conclusion startedAt } \
+            ... on StatusContext { context state createdAt } \
+          } } } \
+          checkSuites(first: 50) { nodes { status } } } } }
+        """
+        guard let (_, repoData) = try? await query(gh: gh, repo: repo, numbers: numbers, fields: fields)
+        else { return [:] }
+
+        var out: [Int: (items: [CheckRollup.Item], suites: [String])] = [:]
+        for case let v as [String: Any] in Array(repoData.values) {
+            guard let n = v["number"] as? Int else { continue }
+            let commit = ((v["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
+                .first?["commit"] as? [String: Any]
+            let rollup = commit?["statusCheckRollup"] as? [String: Any]
+            let contexts = (rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+            let suites = (commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+            out[n] = (contexts.map(CheckRollup.Item.init(json:)),
+                      suites.compactMap { $0["status"] as? String })
+        }
+        return out
     }
 
     /// 边跑边把输出一行行吐出来，装 gh 时用（brew 可能要跑好几分钟，不能干等）
