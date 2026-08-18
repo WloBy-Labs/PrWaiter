@@ -136,9 +136,14 @@ scripts/make_dmg.sh                  # 产出 dist/PrWaiter-<版本>.dmg
 | 等 review | 蓝 | 等人，可以去催 |
 | 可合并 | 绿 | 上游全合了 + 已批准 + CI 通过 —— **该去催了** |
 
-CI 那一列不是直接读 GitHub 的 `statusCheckRollup.state` —— 那个字段把同名 check 的历次尝试
-都算进去（重跑绿了旧的红还在），而且只看已经报上来的（重活还在跑时它就说通过了）。
-PrWaiter 自己拉 check 明细来算：同名只取最新一次尝试，有任何一项在跑就算「运行中」。
+CI 那一列是 PrWaiter 自己算的，不是直接读 GitHub 的 `statusCheckRollup.state` —— 那个字段把
+同名 check 的历次尝试都算进去（重跑绿了旧的红还挂着），而且只看已经报上来的。算法是：
+同名只取最新一次尝试；有失败就是失败；有任何一项在跑就是「运行中」。
+
+还会额外查一次**分支保护的必过项**（`protection.required_status_checks.contexts`，只要读权限
+就能读），比对下来缺哪怕一项没报上来，就算「运行中」—— 这对应 GitHub 界面上的
+「Expected — Waiting for status to be reported」。这些项不在任何 check 接口里，
+连 `gh pr checks` 都看不到，不查这个就会把「重活还没轮到跑」显示成「CI 通过」。
 
 配色按「这件事欠在谁身上」分，**灰色只留给已终结的**：绿=可以动了、红=欠在你身上、
 橙=等机器、蓝=等人、靛=等上游、紫=已合并、灰=已关闭 / 草稿。

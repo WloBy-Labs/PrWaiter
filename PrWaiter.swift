@@ -577,6 +577,9 @@ struct LivePR {
     var url = ""
     var author = ""
     var base = ""       // 目标分支
+    /// check 明细，算 ci 用；分支保护的必过项要等第二轮才拿得到，所以先存着
+    var items: [CheckRollup.Item] = []
+    var suites: [String] = []
     var isDraft = false
     var review: String? // APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
@@ -634,11 +637,14 @@ enum CheckRollup {
     static let pending: Set<String> = ["QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING", "EXPECTED"]
     static let failed: Set<String> = ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]
 
+    /// - required: 分支保护要求的必过项。**这些里面有一项从来没报上来，CI 就没跑完** ——
+    ///   GitHub 界面上那一条「Expected — Waiting for status to be reported」就是它。
+    ///   传空集表示不知道（拿不到分支保护，或者这个分支没保护），那就只按已报上来的算。
+    ///
     /// nil 表示这个 PR 压根没有 CI（有些仓库就是没配），不是「通过」
-    static func state(contexts: [Item], suites: [String]) -> String? {
+    static func state(contexts: [Item], suites: [String], required: Set<String> = []) -> String? {
         // 有 suite 正在跑，说明重活还没报完，先说在跑
         if suites.contains("IN_PROGRESS") { return "PENDING" }
-        guard !contexts.isEmpty else { return nil }
 
         // 同名只留最新一次尝试 —— 重跑绿了就是绿了，旧的那条红不算数
         var latest: [String: Item] = [:]
@@ -647,9 +653,24 @@ enum CheckRollup {
             latest[c.name] = c
         }
         let states = latest.values.map(\.state)
+
+        // 失败排在最前：已经该你动手了，别的还在跑不改变这一点
         if states.contains(where: { failed.contains($0) }) { return "FAILURE" }
         if states.contains(where: { pending.contains($0) }) { return "PENDING" }
+        // 必过项一个都没露面 —— 界面上显示 Expected，压根还没轮到它跑
+        if !required.isSubset(of: Set(latest.keys)) { return "PENDING" }
         return states.isEmpty ? nil : "SUCCESS"
+    }
+
+    /// 从 `repos/{repo}/branches/{branch}` 的响应里挖出必过项清单。
+    /// 只要读权限就能拿到（实测 admin=false、push=false 也读得到），
+    /// 比 `branches/{b}/protection` 那个要 admin 的接口宽松得多。
+    static func requiredContexts(fromBranchJSON data: Data) -> Set<String> {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let prot = obj["protection"] as? [String: Any],
+              let rsc = prot["required_status_checks"] as? [String: Any],
+              let list = rsc["contexts"] as? [String] else { return [] }
+        return Set(list)
     }
 }
 
@@ -1530,6 +1551,26 @@ final class Model: ObservableObject {
         }
     }
 
+    /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，
+    /// 每次刷新都去问一遍纯属浪费。缓存活到进程退出。
+    private final class RequiredCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var map: [String: Set<String>] = [:]
+        func get(_ k: String) -> Set<String>? { lock.lock(); defer { lock.unlock() }; return map[k] }
+        func put(_ k: String, _ v: Set<String>) { lock.lock(); defer { lock.unlock() }; map[k] = v }
+    }
+    private static let requiredCache = RequiredCache()
+
+    /// 某个分支要求哪些 check 必过。拿不到就返回空集（当作不知道，别瞎猜）
+    nonisolated static func requiredChecks(gh: String, repo: String, branch: String) async -> Set<String> {
+        let key = "\(repo)@\(branch)"
+        if let hit = requiredCache.get(key) { return hit }
+        guard let out = try? await run(gh, ["api", "repos/\(repo)/branches/\(branch)"]) else { return [] }
+        let got = CheckRollup.requiredContexts(fromBranchJSON: Data(out.stdout.utf8))
+        requiredCache.put(key, got)
+        return got
+    }
+
     /// 一次 GraphQL 请求拉完整个项目的 PR 状态
     nonisolated static func fetchLive(repo: String, numbers: Set<Int>) async throws -> [Int: LivePR] {
         guard let gh = ghPath() else {
@@ -1580,8 +1621,9 @@ final class Model: ObservableObject {
             lv.isDraft = v["isDraft"] as? Bool ?? false
             lv.url = v["url"] as? String ?? ""
             lv.review = v["reviewDecision"] as? String
-            lv.ci = CheckRollup.state(contexts: contexts.map(CheckRollup.Item.init(json:)),
-                                      suites: suites.compactMap { $0["status"] as? String })
+            lv.items = contexts.map(CheckRollup.Item.init(json:))
+            lv.suites = suites.compactMap { $0["status"] as? String }
+            lv.ci = CheckRollup.state(contexts: lv.items, suites: lv.suites)
             lv.author = (v["author"] as? [String: Any])?["login"] as? String ?? ""
             lv.base = v["baseRefName"] as? String ?? ""
             live[n] = lv
@@ -1590,6 +1632,21 @@ final class Model: ObservableObject {
         if live.isEmpty, let errs = obj["errors"] as? [[String: Any]],
            let msg = errs.first?["message"] as? String {
             throw AppError(msg)
+        }
+
+        // 再把分支保护的必过项算进去。只管还开着的 PR —— 已合并/已关闭的
+        // 追究「当初有没有跑完」没意义，而且老 commit 多半缺几项，会永远显示在跑。
+        let branches = Set(live.values.filter { $0.state == "OPEN" && !$0.base.isEmpty }.map(\.base))
+        var required: [String: Set<String>] = [:]
+        await withTaskGroup(of: (String, Set<String>).self) { group in
+            for b in branches {
+                group.addTask { (b, await requiredChecks(gh: gh, repo: repo, branch: b)) }
+            }
+            for await (b, r) in group { required[b] = r }
+        }
+        for (n, lv) in live where lv.state == "OPEN" {
+            live[n]?.ci = CheckRollup.state(contexts: lv.items, suites: lv.suites,
+                                            required: required[lv.base] ?? [])
         }
         return live
     }

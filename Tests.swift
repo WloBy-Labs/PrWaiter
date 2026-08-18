@@ -690,6 +690,41 @@ struct Tests {
                                          "createdAt": "2026-08-17T11:00:00Z"])
         check(sc.name == "ci/jenkins" && sc.state == "PENDING", "老式 StatusContext 也认")
 
+        // --- 必过项从来没报上来：界面上那条 Expected ---
+        // 实测 mirrorship#60611：分支保护要求 14 项，commit 上报了 34 个 check，
+        // 其中 8 项必过的一次都没露面（ADMIT TEST / BE UT / Clang-Tidy / FE UT ...），
+        // GitHub 界面显示「Some checks haven't completed yet — 8 expected」，
+        // 而所有 check API（含 gh pr checks）都看不见这 8 项。
+        let reported = [run("BUILD", "SKIPPED"), run("behavior-check", "SUCCESS")]
+        check(CheckRollup.state(contexts: reported, suites: ["COMPLETED"],
+                                required: ["BUILD", "behavior-check"]) == "SUCCESS",
+              "必过项都报上来了才算通过")
+        check(CheckRollup.state(contexts: reported, suites: ["COMPLETED"],
+                                required: ["BUILD", "behavior-check", "BE UT"]) == "PENDING",
+              "有必过项一次都没露面 —— 那是还没轮到它跑，不是通过")
+        check(CheckRollup.state(contexts: reported, suites: ["COMPLETED"],
+                                required: []) == "SUCCESS",
+              "拿不到必过项清单时不瞎猜，按已报上来的算")
+        check(CheckRollup.state(contexts: [run("a", "FAILURE")], suites: ["COMPLETED"],
+                                required: ["b"]) == "FAILURE",
+              "已经有红的了，就别说还在跑 —— 该你动手了")
+        // 必过项被 SKIPPED 也算数：GitHub 的分支保护就是这么认的
+        check(CheckRollup.state(contexts: [run("BUILD", "SKIPPED")], suites: ["COMPLETED"],
+                                required: ["BUILD"]) == "SUCCESS", "必过项报了 SKIPPED 也算报过了")
+
+        // --- 解析分支保护的响应 ---
+        let branchJSON = """
+        {"name":"main","protected":true,"protection":{"enabled":true,
+         "required_status_checks":{"enforcement_level":"non_admins",
+         "contexts":["BE UT","Clang-Tidy","ADMIT TEST"]}}}
+        """
+        check(CheckRollup.requiredContexts(fromBranchJSON: Data(branchJSON.utf8))
+              == ["BE UT", "Clang-Tidy", "ADMIT TEST"], "解析出必过项清单")
+        check(CheckRollup.requiredContexts(fromBranchJSON: Data(#"{"name":"x","protected":false}"#.utf8)).isEmpty,
+              "分支没保护时是空集")
+        check(CheckRollup.requiredContexts(fromBranchJSON: Data("不是 JSON".utf8)).isEmpty,
+              "响应坏了也不炸")
+
         // --- 接到 classify 上，界面才会变 ---
         var lv = LivePR(); lv.state = "OPEN"; lv.review = "APPROVED"
         lv.ci = CheckRollup.state(contexts: [run("fast", "SUCCESS")], suites: ["IN_PROGRESS"])

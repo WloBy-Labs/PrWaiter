@@ -14,26 +14,39 @@
 
 ### Fixed
 
-- **CI 状态不再直接信 GitHub 的 `statusCheckRollup.state`，改成自己按 check 明细算。**
-  那个字段算不准，而且**取决于你怎么问** —— 同一个 commit、同一时刻，实测各查 4 次：
+- **CI 明明没跑完，界面显示「CI ✓」。** 两个独立的原因，都修了。
+
+  **一、分支保护要求的必过项，从来没报上来过。** GitHub 界面上那条
+  「Some checks haven't completed yet — 8 expected」「Expected — Waiting for status to be reported」，
+  指的是分支保护里配了必过、但这个 commit 上一次都没出现过的 check。它们不是 check run、
+  不是 check suite、也不是 status context —— **所有 check 接口都看不见它们**，
+  连 `gh pr checks` 都看不见（它只会说 19 pass / 23 skipping）。
+
+  现在多拉一次 `repos/{repo}/branches/{分支}`，从 `protection.required_status_checks.contexts`
+  拿到必过项清单，跟已报上来的比对，缺哪怕一项就是「运行中」。这个接口**只要读权限**就能读
+  （实测 `admin=false`、`push=false` 也读得到），比要 admin 的 `/branches/{b}/protection` 宽松。
+  实测某 PR：要求 14 项、报上来 34 个 check、缺 8 项 —— 跟界面上那个 8 一模一样。
+  只对**还开着的** PR 做这个判断，已合并/关闭的追究这个没意义。
+
+  **二、不再直接信 `statusCheckRollup.state`。** 那个字段算不准，而且**取决于你怎么问** ——
+  同一个 commit、同一时刻，各查 4 次：
 
   ```
   statusCheckRollup { state }                     -> SUCCESS SUCCESS SUCCESS SUCCESS
   statusCheckRollup { state contexts(first:100) } -> FAILURE FAILURE FAILURE FAILURE
   ```
 
-  两条原因：一是它把**同名 check 的历次尝试**都算进去，某个 check 失败后重跑成功，
-  旧那条 FAILURE 还挂在 commit 上（实测某 PR 54 条 context，按名字去重只剩 34 项）；
-  二是它只看**已经报上来的**，跑得快的 lint 先报绿、重活还在跑时，它就已经说通过了 ——
-  这就是「CI 明明没跑完，界面显示 CI 通过」。
+  因为它把**同名 check 的历次尝试**都算进去了：某项失败后重跑成功，旧那条 FAILURE
+  还挂在 commit 上（实测某 PR 54 条 context，按名字去重只剩 34 项）。现在同名只取最新一次尝试。
 
-  现在的算法：同名只取最新一次尝试；任一项失败就是失败；有任何一项在跑、
-  或有 check suite 处于 IN_PROGRESS，就是「运行中」；一条 check 都没有是未知，**不是通过**。
-  拿 15 个最近更新的 open PR 对过，5 个的结论和那个字段不一样，且都是新算法对。
+  **只认 IN_PROGRESS 的 check suite，不认 QUEUED**：仓库上装的每个 GitHub App 都会给每个
+  commit 挂一个 suite，多数一条 check run 都不发，永远停在 QUEUED（实测 StarRocks 每个 commit
+  挂着 5 个这样的空 suite）。认 QUEUED 的话，早就合并的 PR 会永远显示「CI 运行中」。
 
-  **只认 IN_PROGRESS 的 suite，不认 QUEUED**：仓库上装的每个 GitHub App 都会给每个 commit
-  挂一个 suite，多数一条 check run 都不发，永远停在 QUEUED（实测 StarRocks 每个 commit 挂着
-  5 个这样的空 suite）。认 QUEUED 的话，早就合并的 PR 会永远显示「CI 运行中」。
+### 说明
+
+刷新会比以前慢一些：要多拉 check 明细，还要按目标分支各查一次必过项清单
+（清单按 repo@分支 缓存到进程退出，同一个分支只查一次）。
 
 ## [1.0.0] - 2026-08-11
 
