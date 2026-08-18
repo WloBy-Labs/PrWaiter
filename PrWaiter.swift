@@ -1306,26 +1306,24 @@ final class Model: ObservableObject {
         loading = true
         defer { loading = false }
 
-        // 先把 GitHub 上我的 open PR 导进来，再拉状态 —— 顺序反了的话，
-        // 新导入的这一批要等下一轮刷新才有标题和状态
-        if Prefs.autoImportOn {
-            await importMyOpenPRs(into: pid, repo: p.repo)
-        }
-
-        guard let cur = store.projects.first(where: { $0.id == pid }) else { return }
-        let numbers = cur.nodes.allPRNumbers
-        guard !numbers.isEmpty else {
-            // 一个 PR 都没有：也记成「拉过了」，免得每次切回来都白试一次
+        // 状态和「我的 PR」搜索挤在同一次请求里 —— 慢的是握手不是数据量，见 fetchAll
+        let numbers = p.nodes.allPRNumbers
+        let who = Prefs.autoImportOn ? gh.account : nil
+        guard !numbers.isEmpty || !(who ?? "").isEmpty else {
+            // 一个 PR 都没有、也不用自动导入：记成「拉过了」，免得每次切回来都白试一次
             liveByProject[pid] = [:]
             error = nil
             return
         }
         do {
-            let live = try await Self.fetchLive(repo: cur.repo, numbers: numbers)
-            liveByProject[pid] = live
+            let r = try await Self.fetchAll(repo: p.repo, numbers: numbers, account: who)
+            liveByProject[pid] = r.live
             fetchedAt[pid] = Date()
             error = nil
-            fixBackportParents(in: pid, titles: live.mapValues(\.title))
+            fixBackportParents(in: pid, titles: r.live.mapValues(\.title))
+            // 导入放在后面：搜索结果跟状态是同一次请求带回来的，不用再跑一趟。
+            // 新导进来的这一批要等下一拍才有状态 —— 换一次往返（5 秒）不值。
+            if !r.found.isEmpty { importFound(r.found, into: pid) }
         } catch let e {
             error = e.localizedDescription
         }
@@ -1342,9 +1340,8 @@ final class Model: ObservableObject {
         save()
     }
 
-    /// 把当前 gh 账号在该仓库下所有 open 的 PR 导进来（只导没见过的）
-    func importMyOpenPRs(into pid: UUID, repo: String) async {
-        guard let found = try? await Self.fetchMyPRs(repo: repo) else { return }
+    /// 把搜索到的 PR 里没见过的导进来。搜索结果由 fetchAll 一并带回，这里不再发请求。
+    func importFound(_ found: [FoundPR], into pid: UUID) {
         guard let i = store.projects.firstIndex(where: { $0.id == pid }) else { return }
         guard let r = Project.importing(found,
                                         nodes: store.projects[i].nodes,
@@ -1506,50 +1503,8 @@ final class Model: ObservableObject {
         try p.run()   // 不 wait：它要活过本进程
     }
 
-    /// 查当前 gh 账号在该仓库下所有 open 的 PR 编号。
-    /// 用 `gh pr list` 而不是自己拼 GraphQL：一条命令的事，少一份要维护的查询。
-    nonisolated static func fetchMyPRs(repo: String) async throws -> [FoundPR] {
-        guard let gh = ghPath() else { throw AppError("找不到 GitHub CLI（gh）") }
-        guard repo.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil else {
-            throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
-        }
-        // 作者是我、或者指派给我，两者取并集。
-        // 机器人自动建的 backport 常常作者是 bot、只把你设成 assignee，
-        // 光看 author 会漏掉。gh 的两个过滤条件是 AND，所以只能查两次再合并。
-        async let mine = listPRs(gh, repo: repo, filter: ["--author", "@me"])
-        async let assigned = listPRs(gh, repo: repo, filter: ["--assignee", "@me"])
-
-        var byNumber: [Int: FoundPR] = [:]
-        var failures = 0
-        for r in [try? await mine, try? await assigned] {
-            if let r { for p in r { byNumber[p.number] = p } } else { failures += 1 }
-        }
-        // 一条挂了另一条还能用，就用能用的那份；两条都挂才算失败
-        if failures == 2 { throw AppError("gh pr list 调用失败") }
-        return byNumber.values.sorted { $0.number < $1.number }
-    }
-
-    private nonisolated static func listPRs(
-        _ gh: String, repo: String, filter: [String]
-    ) async throws -> [FoundPR] {
-        // --state all：已关闭的也要，好把「主干合了但 backport 被关掉」这种情况显出来。
-        // 收不收由 Project.importing 决定 —— 只收和已跟踪 PR 有关系的那些。
-        let out = try await run(gh, ["pr", "list", "-R", repo, "--state", "all",
-                                     "--limit", "200", "--json", "number,title,state"] + filter)
-        guard let arr = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [[String: Any]]
-        else {
-            throw AppError(out.stderr.isEmpty ? "gh pr list 调用失败" : out.stderr)
-        }
-        return arr.compactMap { d in
-            guard let n = d["number"] as? Int else { return nil }
-            return FoundPR(number: n,
-                           title: d["title"] as? String ?? "",
-                           isOpen: (d["state"] as? String) == "OPEN")
-        }
-    }
-
     /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，
-    /// 每次刷新都去问一遍纯属浪费。缓存活到进程退出。
+    /// 每次刷新都去问一遍纯属浪费（一次请求要 3–5 秒）。缓存活到进程退出。
     private final class RequiredCache: @unchecked Sendable {
         private let lock = NSLock()
         private var map: [String: Set<String>] = [:]
@@ -1568,23 +1523,64 @@ final class Model: ObservableObject {
         return got
     }
 
-    /// 拉完整个项目的 PR 状态。
+    /// 一次 GraphQL 请求拉完所有东西：跟踪中那些 PR 的状态与 check 明细，
+    /// 外加「作者是我」「指派给我」两个搜索（自动导入要用）。
     ///
-    /// 分两趟：第一趟只要基本字段（便宜），第二趟只给**还开着的** PR 拉 check 明细。
-    /// check 明细很贵 —— 20 个 PR 能有 1300 多条 context、190 KB 响应。而已合并/已关闭的
-    /// PR 追究 CI 早就没意义了，状态已经是终局。全是老 PR 的项目直接省掉第二趟。
-    nonisolated static func fetchLive(repo: String, numbers: Set<Int>) async throws -> [Int: LivePR] {
+    /// 为什么要挤成一次：实测这台机器到 api.github.com，**TCP 只要 2ms，TLS 握手却要 1–5 秒**。
+    /// 而 gh 每调用一次就是一个新进程、一条新连接、一次新握手。所以成本几乎全在
+    /// **请求个数**上，跟数据量基本无关 —— 实测同一个查询，1 个别名 5.1 秒、20 个别名 6.6 秒；
+    /// 而多一次请求就要多 5 秒。把 4 次调用（两次 pr list + 两趟 GraphQL）合成 1 次，
+    /// 20 秒降到 9 秒。带上全部 CI 明细多花的 2 秒，比多一次往返的 5 秒划算得多。
+    nonisolated static func fetchAll(repo: String, numbers: Set<Int>, account: String?)
+        async throws -> (live: [Int: LivePR], found: [FoundPR])
+    {
         guard let gh = ghPath() else {
             throw AppError("找不到 GitHub CLI（gh），到设置里可以一键安装")
         }
         guard repo.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil else {
             throw AppError("仓库格式应为 owner/repo，当前是「\(repo)」")
         }
+        let parts = repo.split(separator: "/")
 
-        let basic = "number title state isDraft url reviewDecision baseRefName author { login }"
-        let (obj, repoData) = try await query(gh: gh, repo: repo, numbers: numbers, fields: basic)
+        // contexts 用 last 不用 first：一页最多 100 条，而重跑过几轮的 PR 能到 120+
+        // （实测 StarRocks#77255 有 123 条）。要截也该截掉最老的那一批。
+        let fields = """
+        number title state isDraft url reviewDecision baseRefName author { login } \
+        commits(last: 1) { nodes { commit { \
+          statusCheckRollup { contexts(last: 100) { nodes { \
+            __typename \
+            ... on CheckRun { name status conclusion startedAt } \
+            ... on StatusContext { context state createdAt } \
+          } } } \
+          checkSuites(first: 50) { nodes { status } } } } }
+        """
+        var body = ""
+        if !numbers.isEmpty {
+            let aliases = numbers.sorted()
+                .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
+                .joined(separator: " ")
+            body += " repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) }"
+        }
+        // 作者是我、或者指派给我，两者取并集 —— 机器人建的 backport 作者是 bot、
+        // 只把你设成 assignee，光看 author 会漏掉。搜索条件是 AND，所以要两个。
+        if let who = account, !who.isEmpty {
+            let sel = "nodes { ... on PullRequest { number title state baseRefName } }"
+            for (alias, term) in [("mine", "author"), ("assigned", "assignee")] {
+                body += " \(alias): search(query: \"repo:\(repo) is:pr \(term):\(who) sort:updated-desc\", "
+                    + "type: ISSUE, first: 100) { \(sel) }"
+            }
+        }
+        guard !body.isEmpty else { return ([:], []) }
+
+        let out = try await run(gh, ["api", "graphql", "-f", "query=query {\(body) }"])
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
+            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
+        }
+        let data = (obj["data"] as? [String: Any]) ?? [:]
 
         var live: [Int: LivePR] = [:]
+        var checks: [Int: (items: [CheckRollup.Item], suites: [String])] = [:]
+        let repoData = (data["repository"] as? [String: Any]) ?? [:]
         for case let v as [String: Any] in Array(repoData.values) {
             guard let n = v["number"] as? Int else { continue }
             var lv = LivePR()
@@ -1596,83 +1592,49 @@ final class Model: ObservableObject {
             lv.author = (v["author"] as? [String: Any])?["login"] as? String ?? ""
             lv.base = v["baseRefName"] as? String ?? ""
             live[n] = lv
-        }
-        // 个别编号不存在时 GraphQL 只报部分错误，能拿到的照常显示；全军覆没才抛错
-        if live.isEmpty, let errs = obj["errors"] as? [[String: Any]],
-           let msg = errs.first?["message"] as? String {
-            throw AppError(msg)
-        }
 
-        let open = Set(live.filter { $0.value.state == "OPEN" }.keys)
-        guard !open.isEmpty else { return live }
-
-        // 第二趟：只给开着的 PR 拉 check 明细，同时按目标分支查必过项清单
-        async let checks = openChecks(gh: gh, repo: repo, numbers: open)
-        let branches = Set(open.compactMap { live[$0]?.base }.filter { !$0.isEmpty })
-        var required: [String: Set<String>] = [:]
-        await withTaskGroup(of: (String, Set<String>).self) { group in
-            for b in branches {
-                group.addTask { (b, await requiredChecks(gh: gh, repo: repo, branch: b)) }
-            }
-            for await (b, r) in group { required[b] = r }
-        }
-        for (n, parsed) in await checks {
-            let base = live[n]?.base ?? ""
-            live[n]?.ci = CheckRollup.state(contexts: parsed.items, suites: parsed.suites,
-                                            required: required[base] ?? [])
-        }
-        return live
-    }
-
-    /// 把编号拼成一次带别名的查询，返回整个响应和 repository 那一层
-    private nonisolated static func query(
-        gh: String, repo: String, numbers: Set<Int>, fields: String
-    ) async throws -> ([String: Any], [String: Any]) {
-        let parts = repo.split(separator: "/")
-        let aliases = numbers.sorted()
-            .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
-            .joined(separator: " ")
-        let q = "query { repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) } }"
-        let out = try await run(gh, ["api", "graphql", "-f", "query=\(q)"])
-        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
-            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
-        }
-        return (obj, ((obj["data"] as? [String: Any])?["repository"] as? [String: Any]) ?? [:])
-    }
-
-    /// 开着的 PR 的 check 明细。
-    ///
-    /// 不要 statusCheckRollup 那个 state —— 它算不准，见 CheckRollup 的注释，自己按明细算。
-    /// contexts 用 last 不用 first：一页最多 100 条，而重跑过几轮的 PR 能到 120+
-    /// （实测 StarRocks#77255 有 123 条）。要截也该截掉最老的那一批 ——
-    /// 实测同一个 PR，last:100 覆盖到 71 个不同 check，first:100 只有 64 个。
-    private nonisolated static func openChecks(
-        gh: String, repo: String, numbers: Set<Int>
-    ) async -> [Int: (items: [CheckRollup.Item], suites: [String])] {
-        let fields = """
-        number commits(last: 1) { nodes { commit { \
-          statusCheckRollup { contexts(last: 100) { nodes { \
-            __typename \
-            ... on CheckRun { name status conclusion startedAt } \
-            ... on StatusContext { context state createdAt } \
-          } } } \
-          checkSuites(first: 50) { nodes { status } } } } }
-        """
-        guard let (_, repoData) = try? await query(gh: gh, repo: repo, numbers: numbers, fields: fields)
-        else { return [:] }
-
-        var out: [Int: (items: [CheckRollup.Item], suites: [String])] = [:]
-        for case let v as [String: Any] in Array(repoData.values) {
-            guard let n = v["number"] as? Int else { continue }
             let commit = ((v["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
                 .first?["commit"] as? [String: Any]
             let rollup = commit?["statusCheckRollup"] as? [String: Any]
             let contexts = (rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
             let suites = (commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
-            out[n] = (contexts.map(CheckRollup.Item.init(json:)),
-                      suites.compactMap { $0["status"] as? String })
+            checks[n] = (contexts.map(CheckRollup.Item.init(json:)),
+                         suites.compactMap { $0["status"] as? String })
         }
-        return out
+        // 个别编号不存在时 GraphQL 只报部分错误，能拿到的照常显示；全军覆没才抛错
+        if live.isEmpty, !numbers.isEmpty, let errs = obj["errors"] as? [[String: Any]],
+           let msg = errs.first?["message"] as? String {
+            throw AppError(msg)
+        }
+
+        // 必过项清单按分支查，只管还开着的 PR。清单进程内缓存，同一个分支只查一次。
+        let openBranches = Set(live.values.filter { $0.state == "OPEN" && !$0.base.isEmpty }.map(\.base))
+        var required: [String: Set<String>] = [:]
+        await withTaskGroup(of: (String, Set<String>).self) { group in
+            for b in openBranches {
+                group.addTask { (b, await requiredChecks(gh: gh, repo: repo, branch: b)) }
+            }
+            for await (b, r) in group { required[b] = r }
+        }
+        // CI 结论只给还开着的 PR 算 —— 已合并/已关闭的状态已经是终局，
+        // 那一栏只会挂着重跑前留下的假红，是噪音
+        for (n, lv) in live where lv.state == "OPEN" {
+            guard let c = checks[n] else { continue }
+            live[n]?.ci = CheckRollup.state(contexts: c.items, suites: c.suites,
+                                            required: required[lv.base] ?? [])
+        }
+
+        var found: [Int: FoundPR] = [:]
+        for key in ["mine", "assigned"] {
+            let nodes = ((data[key] as? [String: Any])?["nodes"] as? [[String: Any]]) ?? []
+            for d in nodes {
+                guard let n = d["number"] as? Int else { continue }
+                found[n] = FoundPR(number: n,
+                                   title: d["title"] as? String ?? "",
+                                   isOpen: (d["state"] as? String) == "OPEN")
+            }
+        }
+        return (live, found.values.sorted { $0.number < $1.number })
     }
 
     /// 边跑边把输出一行行吐出来，装 gh 时用（brew 可能要跑好几分钟，不能干等）
