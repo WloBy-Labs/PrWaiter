@@ -887,33 +887,33 @@ struct Tests {
         }
 
         // --- 基本分档 ---
-        check(CheckRollup.state(contexts: [run("a", "SUCCESS")], suites: ["COMPLETED"]) == "SUCCESS",
+        check(CheckRollup.state(contexts: [run("a", "SUCCESS")], suites: [CheckRollup.Suite(status: "COMPLETED")]) == "SUCCESS",
               "全绿就是通过")
         check(CheckRollup.state(contexts: [run("a", "SUCCESS"), run("b", "FAILURE")],
-                                suites: ["COMPLETED"]) == "FAILURE", "有一个红就是红")
+                                suites: [CheckRollup.Suite(status: "COMPLETED")]) == "FAILURE", "有一个红就是红")
         check(CheckRollup.state(contexts: [run("a", "SUCCESS"), run("b", "IN_PROGRESS")],
-                                suites: ["COMPLETED"]) == "PENDING", "还有在跑的就是在跑")
+                                suites: [CheckRollup.Suite(status: "COMPLETED")]) == "PENDING", "还有在跑的就是在跑")
         check(CheckRollup.state(contexts: [run("a", "SKIPPED"), run("b", "NEUTRAL")],
-                                suites: ["COMPLETED"]) == "SUCCESS", "跳过和 neutral 不算失败")
+                                suites: [CheckRollup.Suite(status: "COMPLETED")]) == "SUCCESS", "跳过和 neutral 不算失败")
         check(CheckRollup.state(contexts: [run("a", "FAILURE"), run("b", "QUEUED")],
-                                suites: ["COMPLETED"]) == "FAILURE", "红优先于在跑 —— 已经该你动手了")
+                                suites: [CheckRollup.Suite(status: "COMPLETED")]) == "FAILURE", "红优先于在跑 —— 已经该你动手了")
 
         // --- 没有 CI 的仓库：unknown，不是「通过」 ---
-        check(CheckRollup.state(contexts: [], suites: []) == nil, "一条 check 都没有时是 unknown")
+        check(CheckRollup.state(contexts: [], suites: [] as [CheckRollup.Suite]) == nil, "一条 check 都没有时是 unknown")
 
         // --- 关键一条：有 suite 在跑，就别说通过 ---
         // 刚推完代码，跑得快的先报绿，重活还在跑 —— 这正是「CI 没跑完却显示通过」
         check(CheckRollup.state(contexts: [run("title-check", "SUCCESS")],
-                                suites: ["COMPLETED", "IN_PROGRESS"]) == "PENDING",
+                                suites: [CheckRollup.Suite(status: "COMPLETED"), CheckRollup.Suite(status: "IN_PROGRESS")]) == "PENDING",
               "还有 suite 在跑时不算通过，哪怕已报上来的全绿")
 
         // 但 QUEUED 不能算 —— 仓库上装的每个 GitHub App 都会挂一个 suite，
         // 多数一条 check run 都不发，永远停在 QUEUED。实测 StarRocks 每个 commit
         // 都挂着 5 个这样的空 suite，认 QUEUED 的话早就合并的 PR 会永远显示「CI 运行中」
         check(CheckRollup.state(contexts: [run("a", "SUCCESS")],
-                                suites: ["COMPLETED", "QUEUED"]) == "SUCCESS",
+                                suites: [CheckRollup.Suite(status: "COMPLETED"), CheckRollup.Suite(status: "QUEUED")]) == "SUCCESS",
               "空转的 QUEUED suite 不算在跑（装了 App 就会有，永远不完成）")
-        check(CheckRollup.state(contexts: [], suites: ["QUEUED"]) == nil,
+        check(CheckRollup.state(contexts: [], suites: [CheckRollup.Suite(status: "QUEUED")]) == nil,
               "只有空 suite、一条 check 都没有，是 unknown")
 
         // --- 另一条关键：同名多次尝试只算最新的 ---
@@ -923,15 +923,15 @@ struct Tests {
             run("backport-check", "FAILURE", "2026-08-17T11:40:00Z"),
             run("backport-check", "SUCCESS", "2026-08-17T12:10:00Z"),
         ]
-        check(CheckRollup.state(contexts: retried, suites: ["COMPLETED"]) == "SUCCESS",
+        check(CheckRollup.state(contexts: retried, suites: [CheckRollup.Suite(status: "COMPLETED")]) == "SUCCESS",
               "重跑绿了就是绿了，旧的那条红不算数")
-        check(CheckRollup.state(contexts: retried.reversed(), suites: ["COMPLETED"]) == "SUCCESS",
+        check(CheckRollup.state(contexts: retried.reversed(), suites: [CheckRollup.Suite(status: "COMPLETED")]) == "SUCCESS",
               "跟 GitHub 返回的先后顺序无关，看时间戳")
         let regressed = [
             run("BUILD", "SUCCESS", "2026-08-17T11:40:00Z"),
             run("BUILD", "FAILURE", "2026-08-17T12:10:00Z"),
         ]
-        check(CheckRollup.state(contexts: regressed, suites: ["COMPLETED"]) == "FAILURE",
+        check(CheckRollup.state(contexts: regressed, suites: [CheckRollup.Suite(status: "COMPLETED")]) == "FAILURE",
               "反过来也认：重跑挂了就是挂了")
 
         // --- 解析 GraphQL 两种节点 ---
@@ -951,21 +951,50 @@ struct Tests {
         // GitHub 界面显示「Some checks haven't completed yet — 8 expected」，
         // 而所有 check API（含 gh pr checks）都看不见这 8 项。
         let reported = [run("BUILD", "SKIPPED"), run("behavior-check", "SUCCESS")]
-        check(CheckRollup.state(contexts: reported, suites: ["COMPLETED"],
+        check(CheckRollup.state(contexts: reported, suites: [CheckRollup.Suite(status: "COMPLETED")],
                                 required: ["BUILD", "behavior-check"]) == "SUCCESS",
               "必过项都报上来了才算通过")
-        check(CheckRollup.state(contexts: reported, suites: ["COMPLETED"],
+        check(CheckRollup.state(contexts: reported, suites: [CheckRollup.Suite(status: "COMPLETED")],
                                 required: ["BUILD", "behavior-check", "BE UT"]) == "PENDING",
               "有必过项一次都没露面 —— 那是还没轮到它跑，不是通过")
-        check(CheckRollup.state(contexts: reported, suites: ["COMPLETED"],
+        check(CheckRollup.state(contexts: reported, suites: [CheckRollup.Suite(status: "COMPLETED")],
                                 required: []) == "SUCCESS",
               "拿不到必过项清单时不瞎猜，按已报上来的算")
-        check(CheckRollup.state(contexts: [run("a", "FAILURE")], suites: ["COMPLETED"],
+        check(CheckRollup.state(contexts: [run("a", "FAILURE")], suites: [CheckRollup.Suite(status: "COMPLETED")],
                                 required: ["b"]) == "FAILURE",
               "已经有红的了，就别说还在跑 —— 该你动手了")
         // 必过项被 SKIPPED 也算数：GitHub 的分支保护就是这么认的
-        check(CheckRollup.state(contexts: [run("BUILD", "SKIPPED")], suites: ["COMPLETED"],
+        check(CheckRollup.state(contexts: [run("BUILD", "SKIPPED")], suites: [CheckRollup.Suite(status: "COMPLETED")],
                                 required: ["BUILD"]) == "SUCCESS", "必过项报了 SKIPPED 也算报过了")
+
+        // --- workflow 等维护者批准：不是「跑完了」，也不是「还在跑」 ---
+        // 线上撞到过：apache/maka #3448/#3430 是 fork PR，CI 要维护者点「批准运行」。
+        // 那时 suite 长这样：status=COMPLETED、conclusion=ACTION_REQUIRED、0 条 check run。
+        // 我第一版只看 status，判成「跑完了什么都不会来」，差点把它改成「未知」——
+        // 而 GitHub 页面上明写着 1 workflow awaiting approval。
+        let awaiting = [CheckRollup.Suite(status: "COMPLETED", conclusion: "ACTION_REQUIRED")]
+        check(CheckRollup.state(contexts: [], suites: awaiting, required: ["test"]) == "ACTION_REQUIRED",
+              "suite 的 conclusion 是 ACTION_REQUIRED → 等批准")
+        check(CheckRollup.state(contexts: [], suites: awaiting) == "ACTION_REQUIRED",
+              "没配必过项也一样认")
+        check(Model.classify(LivePR(title: "", state: "OPEN", review: "APPROVED",
+                                    ci: "ACTION_REQUIRED"), blocked: false) == .needsCIApproval,
+              "已批准但 CI 等批准 → 显示「CI 等批准」，不是「可合并」")
+        check(PRStatus.needsCIApproval.label == "CI 等批准", "有自己的名字，不跟「运行中」混")
+        // 等批准不是失败
+        check(!CheckRollup.failed.contains("ACTION_REQUIRED"), "ACTION_REQUIRED 不算失败")
+        // check run 层面也认（有些工作流是在 run 上标的）
+        check(CheckRollup.state(contexts: [run("gate", "ACTION_REQUIRED")],
+                                suites: [CheckRollup.Suite(status: "COMPLETED")]) == "ACTION_REQUIRED",
+              "check run 的 conclusion 是 ACTION_REQUIRED 也认")
+        // 一码归一码：全绿的 suite 不该被误判
+        check(CheckRollup.state(contexts: [run("a", "SUCCESS")],
+                                suites: [CheckRollup.Suite(status: "COMPLETED", conclusion: "SUCCESS")])
+              == "SUCCESS", "正常跑完的不受影响")
+        // 上游还没合时，「等依赖」更靠前 —— 那件事得先解决
+        check(Model.classify(LivePR(title: "", state: "OPEN", review: "APPROVED",
+                                    ci: "ACTION_REQUIRED"), blocked: true) == .blocked,
+              "被上游挡着时先说「等依赖」")
 
         // --- 解析分支保护的响应 ---
         let branchJSON = """
@@ -982,7 +1011,7 @@ struct Tests {
 
         // --- 接到 classify 上，界面才会变 ---
         var lv = LivePR(); lv.state = "OPEN"; lv.review = "APPROVED"
-        lv.ci = CheckRollup.state(contexts: [run("fast", "SUCCESS")], suites: ["IN_PROGRESS"])
+        lv.ci = CheckRollup.state(contexts: [run("fast", "SUCCESS")], suites: [CheckRollup.Suite(status: "IN_PROGRESS")])
         check(Model.classify(lv, blocked: false) == .ciRunning,
               "已批准但 CI 还在跑，显示的是「CI 运行中」而不是「可合并」")
     }

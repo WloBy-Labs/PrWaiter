@@ -10,6 +10,27 @@
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-22
+
+### Fixed
+
+- **「等维护者批准 workflow」被显示成「CI 运行中」。** 现在是单独一档 **「CI 等批准」**（橙，✋）。
+
+  fork PR 的 CI 要维护者点一下「批准运行」才会跑。这种状态下 check suite 长这样：
+
+  ```
+  status = COMPLETED        conclusion = ACTION_REQUIRED       0 条 check run
+  ```
+
+  原来只读了 `status`，看到 COMPLETED 就当成「跑完了」，于是既没有 check 也没有必过项，
+  只好靠「必过项没报上来」那条规则兜成「运行中」—— 说法不准：**不点批准的话一步都不会跑，
+  它不是在跑，是在等人**。现在连 `conclusion` 一起读，认出这一档。
+
+  相应地把 `ACTION_REQUIRED` 从「失败」集合里挪出来了 —— 它不是失败，是等人。
+
+  实测 `apache/maka` 的 #3448 / #3443 / #3435 / #3430 就是这个状态，GitHub 页面上写的是
+  `1 workflow awaiting approval`。
+
 ## [1.1.0] - 2026-08-22
 
 多了一个 **reviewer 视角**。此前整个 App 都是创作者视角 —— 我写的 PR 排到哪了；
