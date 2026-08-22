@@ -637,12 +637,16 @@ struct ReviewItem: Identifiable {
     /// 等我批准的补充说明，比如卡在哪个环境
     let note: String
 
+    /// 「@ 到我」这一档：最近一次别人点我、而我还没回话的时间
+    var pingedAt: Date? = nil
+
+
     var id: String { number > 0 ? "\(repo)#\(number)" : "\(repo)!\(url)" }
 
     func with(kind: Kind) -> ReviewItem {
         ReviewItem(kind: kind, repo: repo, number: number, title: title, url: url,
                    author: author, base: base, isDraft: isDraft, review: review, ci: ci,
-                   at: at, note: note)
+                   at: at, note: note, pingedAt: pingedAt)
     }
 }
 
@@ -1640,6 +1644,16 @@ final class Model: ObservableObject {
           } } } \
           checkSuites(first: 50) { nodes { status } } } } }
         """
+        // 「@ 到我」得多要一批时间戳：谁在什么时候点了我、我最后一次发言是什么时候。
+        // 只给这一档要 —— 另两档不需要，白拉一堆评论纯属浪费。
+        // 各拿最近 N 条：更早的 @ 就算漏了也已经是老新闻，不值得为它把请求撑大。
+        let talkFields = """
+        bodyText createdAt \
+        comments(last: 30) { nodes { author { login } createdAt bodyText } } \
+        reviews(last: 10) { nodes { author { login } submittedAt bodyText } } \
+        reviewThreads(first: 20) { nodes { comments(first: 5) { \
+          nodes { author { login } createdAt bodyText } } } }
+        """
         let kinds: [(String, String, ReviewItem.Kind)] = [
             ("req", "review-requested:\(account)", .requested),
             ("asg", "assignee:\(account)", .assigned),
@@ -1649,10 +1663,11 @@ final class Model: ObservableObject {
         for (i, repo) in valid.enumerated() {
             let parts = repo.split(separator: "/")
             body += " perm\(i): repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { viewerPermission }"
-            for (tag, term, _) in kinds {
+            for (tag, term, kind) in kinds {
+                let fields = kind == .mentioned ? prFields + " " + talkFields : prFields
                 body += " \(tag)\(i): search(query: \"repo:\(repo) is:pr is:open -author:\(account) "
                     + "\(term) sort:updated-desc\", type: ISSUE, first: 30) "
-                    + "{ nodes { ... on PullRequest { \(prFields) } } }"
+                    + "{ nodes { ... on PullRequest { \(fields) } } }"
             }
         }
         let out = try await run(gh, ["api", "graphql", "-f", "query=query {\(body) }"])
@@ -1755,6 +1770,54 @@ final class Model: ObservableObject {
         }
     }
 
+    /// 一条「@ 到我」还该不该显示，以及最近一次被点是什么时候。
+    ///
+    /// 规则：**有人在我最后一次发言之后又点了我**，才算还欠着我。
+    /// 所以不必回复那条 @ 本身 —— 我在这个 PR 上随便说句话、或者提交一次 review，
+    /// 就算我接手了。反过来，我说完之后别人又点我一次，它会重新冒出来。
+    ///
+    /// nil 表示不用显示（我已经回过话了）。
+    nonisolated static func pingTime(_ d: [String: Any], account: String) -> Date? {
+        let me = "@\(account)".lowercased()
+
+        /// 一条发言：谁说的、什么时候、有没有点我
+        func lines(_ container: [String: Any]?, _ key: String, _ timeKey: String) -> [(String, Date, Bool)] {
+            let nodes = (container?[key] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+            return nodes.compactMap { n in
+                guard let t = (n[timeKey] as? String).flatMap(GhParse.date(from:)) else { return nil }
+                let who = (n["author"] as? [String: Any])?["login"] as? String ?? ""
+                let text = (n["bodyText"] as? String ?? "").lowercased()
+                return (who, t, text.contains(me))
+            }
+        }
+
+        var all = lines(d, "comments", "createdAt") + lines(d, "reviews", "submittedAt")
+        // 行内评论（review thread）也算 —— 大仓库里 @ 人多半发生在具体代码行上
+        let threads = (d["reviewThreads"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+        for t in threads { all += lines(t, "comments", "createdAt") }
+        // PR 正文里点我也算一次，时间就是开 PR 的时间
+        if let body = d["bodyText"] as? String, body.lowercased().contains(me),
+           let t = (d["createdAt"] as? String).flatMap(GhParse.date(from:)) {
+            let who = (d["author"] as? [String: Any])?["login"] as? String ?? ""
+            all.append((who, t, true))
+        }
+
+        let pinged = all.filter { $0.2 && $0.0 != account }.map(\.1).max()
+        let mySay = all.filter { $0.0 == account }.map(\.1).max()
+
+        guard let ping = pinged else {
+            // 扫到了「@我」但全是我自己写的（提醒自己那种）：没人在等我
+            if all.contains(where: { $0.2 }) { return nil }
+            // 一条「@我的字样」都没扫到：可能是按团队 @ 的、或者在我们没拉到的那些评论里。
+            // 这种情况用 PR 的更新时间兜底 —— 宁可显示出来让人自己判断，也别悄悄吞掉
+            let fallback = (d["updatedAt"] as? String).flatMap(GhParse.date(from:))
+            if let mine = mySay, let f = fallback, mine >= f { return nil }
+            return fallback
+        }
+        if let mine = mySay, mine > ping { return nil }   // 我在那之后说过话了，不欠着
+        return ping
+    }
+
     nonisolated static func parseReviewItem(
         _ d: [String: Any], repo: String, kind: ReviewItem.Kind, account: String
     ) -> ReviewItem? {
@@ -1783,6 +1846,12 @@ final class Model: ObservableObject {
         // （实测配置里的 maka-agent/maka-agent 现在已经是 apache/maka）
         let real = ((d["repository"] as? [String: Any])?["nameWithOwner"] as? String) ?? repo
 
+        var ping: Date?
+        if kind == .mentioned {
+            guard let p = pingTime(d, account: account) else { return nil }   // 我已经回过话了
+            ping = p
+        }
+
         return ReviewItem(
             kind: kind, repo: real, number: n,
             title: d["title"] as? String ?? "",
@@ -1792,8 +1861,8 @@ final class Model: ObservableObject {
             isDraft: d["isDraft"] as? Bool ?? false,
             review: d["reviewDecision"] as? String,
             ci: CheckRollup.state(contexts: contexts, suites: suites),
-            at: mine.max() ?? fallback,
-            note: "")
+            at: ping ?? mine.max() ?? fallback,
+            note: "", pingedAt: ping)
     }
 
     /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，

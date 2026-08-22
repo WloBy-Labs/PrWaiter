@@ -727,6 +727,89 @@ struct Tests {
         check(Model.parseReviewItem(noRepo, repo: "o/a", kind: .requested, account: "me")?.repo
               == "o/a", "响应里没带仓库名时退回查询时填的那个")
 
+        // --- 「@ 到我」什么时候算消掉 ---
+        // 规则：有人在我最后一次发言之后又点了我，才算还欠着。
+        // 不必回复那条 @ 本身 —— 提交 review（含批准）、新加评论、回复他，都算我接手了。
+        func talk(comments: [[String: Any]] = [], reviews: [[String: Any]] = [],
+                  threads: [[String: Any]] = [], body: String = "", created: String = "2026-08-01T00:00:00Z",
+                  updated: String = "2026-08-22T02:00:00Z") -> [String: Any] {
+            ["bodyText": body, "createdAt": created, "updatedAt": updated,
+             "author": ["login": "someone"],
+             "comments": ["nodes": comments], "reviews": ["nodes": reviews],
+             "reviewThreads": ["nodes": threads]]
+        }
+        func said(_ who: String, _ t: String, _ text: String) -> [String: Any] {
+            ["author": ["login": who], "createdAt": t, "bodyText": text]
+        }
+        func reviewed(_ who: String, _ t: String, _ text: String = "") -> [String: Any] {
+            ["author": ["login": who], "submittedAt": t, "bodyText": text]
+        }
+
+        // 别人点了我，我还没说过话 → 显示，时间是被点的那一刻
+        let pinged = talk(comments: [said("other", "2026-08-21T09:00:00Z", "这块 @me 看下")])
+        check(Model.pingTime(pinged, account: "me") == GhParse.date(from: "2026-08-21T09:00:00Z"),
+              "别人点了我、我没回 → 还欠着，时间是被点那一刻")
+
+        // 我之后加了条评论 → 消掉（不用回那条）
+        let replied = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@me 看下"),
+                                      said("me", "2026-08-21T10:00:00Z", "在别处说了句别的")])
+        check(Model.pingTime(replied, account: "me") == nil, "我之后随便说句话就算接手，不必回那条")
+
+        // 我之后提交了 review（批准也算「我动了」）
+        let approved = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@me 看下")],
+                            reviews: [reviewed("me", "2026-08-21T11:00:00Z")])
+        check(Model.pingTime(approved, account: "me") == nil, "提交 review（含批准）也算接手")
+
+        // 我说完之后又被点一次 → 重新冒出来，时间换成新那次
+        let again = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@me 看下"),
+                                    said("me", "2026-08-21T10:00:00Z", "回了"),
+                                    said("other", "2026-08-21T12:00:00Z", "@me 还有个问题")])
+        check(Model.pingTime(again, account: "me") == GhParse.date(from: "2026-08-21T12:00:00Z"),
+              "我回完之后又被点 → 带新时间戳重新冒出来")
+
+        // 行内评论（review thread）里点我也算 —— 大仓库里 @ 人多半发生在具体代码行上
+        let inThread = talk(threads: [["comments": ["nodes": [said("other", "2026-08-21T08:00:00Z", "@me 这行")]]]])
+        check(Model.pingTime(inThread, account: "me") == GhParse.date(from: "2026-08-21T08:00:00Z"),
+              "行内评论里点我也算")
+
+        // PR 正文里点我，时间算开 PR 那一刻
+        let inBody = talk(body: "cc @me 帮忙看下", created: "2026-08-20T00:00:00Z")
+        check(Model.pingTime(inBody, account: "me") == GhParse.date(from: "2026-08-20T00:00:00Z"),
+              "PR 正文里点我也算，时间是开 PR 的时间")
+
+        // 我自己点自己不算
+        let selfPing = talk(comments: [said("me", "2026-08-21T09:00:00Z", "@me 提醒自己")])
+        check(Model.pingTime(selfPing, account: "me") == nil, "我自己写的 @我 不算别人在等我")
+
+        // 大小写不敏感 —— GitHub 的用户名不区分大小写
+        let cased = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@ME 看下")])
+        check(Model.pingTime(cased, account: "me") != nil, "@ 的大小写不影响判断")
+
+        // 扫不到「@我」的字样（按团队 @ 的、或在没拉到的那些评论里）：
+        // 用 PR 更新时间兜底，宁可显示出来让人自己判断，也别悄悄吞掉
+        let teamPing = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@storage-team 看下")])
+        check(Model.pingTime(teamPing, account: "me") == GhParse.date(from: "2026-08-22T02:00:00Z"),
+              "扫不到明确的 @我 时不吞掉，用更新时间兜底")
+        // 但我最后说话比这还新，就当处理过了
+        let teamThenMe = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@storage-team"),
+                                         said("me", "2026-08-22T03:00:00Z", "回了")],
+                              updated: "2026-08-22T02:00:00Z")
+        check(Model.pingTime(teamThenMe, account: "me") == nil, "兜底情况下我说过话也算接手")
+
+        // 接到解析上：已处理的那条根本不进清单
+        var handled = base
+        for (k, v) in replied { handled[k] = v }
+        check(Model.parseReviewItem(handled, repo: "o/a", kind: .mentioned, account: "me") == nil,
+              "已经回过话的 @ 不进清单")
+        var pendingPing = base
+        for (k, v) in pinged { pendingPing[k] = v }
+        let pi = Model.parseReviewItem(pendingPing, repo: "o/a", kind: .mentioned, account: "me")
+        check(pi != nil, "没回过话的 @ 要进清单")
+        check(pi?.at == GhParse.date(from: "2026-08-21T09:00:00Z"), "排序用的是被点那一刻")
+        // 另外两档不看这个规则：请我 review / 指派给我 有各自的消除方式（GitHub 自己会撤）
+        check(Model.parseReviewItem(handled, repo: "o/a", kind: .requested, account: "me") != nil,
+              "「请我 review」不受这条规则影响")
+
         check(GhParse.date(from: "2026-08-20T06:14:00Z") != nil, "解析 ISO8601 时间戳")
         check(GhParse.date(from: "不是时间") == nil, "解析不了就返回 nil")
     }
