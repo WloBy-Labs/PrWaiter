@@ -1,0 +1,12 @@
+# 临时探针：验证「workflow 等人批准」这个状态在 API 里长什么样。
+# 用完就删，不进 main。
+name: Approval Probe
+on:
+  pull_request:
+    paths: ['.github/workflows/approval-probe.yml']
+jobs:
+  gated:
+    runs-on: ubuntu-latest
+    environment: approval-probe   # 这个 environment 配了必需审批人，所以这一步会挂起等批准
+    steps:
+      - run: echo "批准之后才会跑到这里"
