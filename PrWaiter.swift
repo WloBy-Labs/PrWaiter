@@ -640,6 +640,9 @@ struct ReviewItem: Identifiable {
     let at: Date?
     /// 等我批准的补充说明，比如卡在哪个环境
     let note: String
+    /// 查的时候用的仓库名（配置里填的那个）。跟 repo 可能不一样 —— 仓库改名后
+    /// GitHub 返回新名字，但要跟看板对账得用配置里的旧名
+    var queried: String = ""
 
     /// 「@ 到我」这一档：最近一次别人点我、而我还没回话的时间
     var pingedAt: Date? = nil
@@ -650,7 +653,7 @@ struct ReviewItem: Identifiable {
     func with(kind: Kind) -> ReviewItem {
         ReviewItem(kind: kind, repo: repo, number: number, title: title, url: url,
                    author: author, base: base, isDraft: isDraft, review: review, ci: ci,
-                   at: at, note: note, pingedAt: pingedAt)
+                   at: at, note: note, queried: queried, pingedAt: pingedAt)
     }
 }
 
@@ -1093,9 +1096,14 @@ final class Model: ObservableObject {
     // 按项目分开缓存：切标签时上一次拉到的数据还在，能立刻显示，不用等网络
     @Published private var liveByProject: [UUID: [Int: LivePR]] = [:]
     @Published private var fetchedAt: [UUID: Date] = [:]
-    @Published var error: String?         // 拉取失败
+    /// 拉取失败，按项目分开记 —— 所有项目并发刷新，别的项目挂了
+    /// 不该显示在你正看着的这个项目头上
+    @Published var errorByProject: [UUID: String] = [:]
+    var error: String? { store.selected.flatMap { errorByProject[$0] } }
     @Published var saveError: String?     // 落盘失败 —— 比拉取失败严重，改动是真丢
     @Published var loading = false
+    /// 正在拉的项目。所有项目并发刷新时，单个 Bool 挡不住重入
+    private var inFlight = Set<UUID>()
     @Published var editing = false
     @Published var gh = GhStatus()
     @Published var detecting = false
@@ -1143,10 +1151,9 @@ final class Model: ObservableObject {
         if !Prefs.tutorialDoneFlag { tourIndex = 0 }
         // 先探测 gh，再干活 —— 两边都要账号。detectToolchain 内部会去重，
         // 所以这两个 Task 只会真探测一次
-        Task { await self.refresh() }
-        // 启动时也拉一次 reviewer 清单：标签上那个数字得一打开就是准的，
-        // 否则「有人在等我」这件事要点进去才知道，等于白做
-        Task { await self.refreshInbox() }
+        // 一上来就把所有项目和评审清单都拉一遍：切换按钮上那个待办数
+        // 得一打开就是准的，否则「有人在等我」这件事要点进去才知道，等于白做
+        Task { await self.refreshEverything() }
         if Prefs.autoCheckUpdateOn {
             Task { await self.checkForUpdate(auto: true) }
         }
@@ -1160,11 +1167,7 @@ final class Model: ObservableObject {
         let seconds = Prefs.interval
         guard seconds > 0 else { return }
         timer = Timer.scheduledTimer(withTimeInterval: Double(seconds), repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                await self?.refresh()
-                // 打开过 reviewer 视角才跟着刷 —— 没用过的话不白花一次请求（一次要 5–9 秒）
-                if self?.inboxAt != nil { await self?.refreshInbox() }
-            }
+            Task { @MainActor in await self?.refreshEverything() }
         }
     }
 
@@ -1242,7 +1245,6 @@ final class Model: ObservableObject {
     func select(_ id: UUID) {
         guard store.selected != id else { return }
         store.selected = id
-        error = nil
         save()
         // 切标签不重新拉取：上次的数据立刻显示，要最新的自己点刷新，
         // 定时器下一拍也会带上。只有从没拉过的项目才拉一次，不然会是一片空白。
@@ -1322,11 +1324,38 @@ final class Model: ObservableObject {
     @Published var inboxLoading = false
     @Published var inboxError: String?
 
+    /// 有没有「等我批准」那种最急的 —— 气泡变橙色
+    var inboxUrgent: Bool { inbox.contains { $0.kind == .approveCI } }
+
     /// 只查已配置的项目仓库（去重）—— 跨全网的 review 请求先不管，
     /// 你关心的就是这几个仓库
     var inboxRepos: [String] {
         var seen = Set<String>()
         return store.projects.map(\.repo).filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    /// 看板已经在跟的 PR：`仓库#编号`。两个视角是两套东西，不该同一条 PR 两边都出现。
+    ///
+    /// 主要挡的是机器人代建的 backport —— 作者是 bot、把我设成 assignee，看板按
+    /// assignee 把它导进来当我的贡献（本来就是我的改动被 backport），
+    /// 但评审清单按 `assignee:@me` 也会搜到它。它归看板。
+    var trackedPRs: Set<String> {
+        var out = Set<String>()
+        for p in store.projects where !p.repo.isEmpty {
+            for n in p.nodes.allPRNumbers { out.insert("\(p.repo)#\(n)") }
+        }
+        return out
+    }
+
+    /// 滤掉看板已经在跟的那些。纯函数，方便单测。
+    ///
+    /// 对账用**查询时的仓库名**（配置里填的那个），不是 GitHub 返回的真名 ——
+    /// 仓库改过名的话两者不一样，用真名会对不上、白白漏掉。
+    nonisolated static func excludeTracked(_ items: [ReviewItem], tracked: Set<String>) -> [ReviewItem] {
+        items.filter { it in
+            let key = "\(it.queried.isEmpty ? it.repo : it.queried)#\(it.number)"
+            return !tracked.contains(key) && !tracked.contains(it.id)
+        }
     }
 
     /// 忽略这一次 @：这条从清单里去掉，下次有人再点我（时间更晚）还会重新出现
@@ -1356,7 +1385,8 @@ final class Model: ObservableObject {
         }
         do {
             let got = try await Self.fetchReviewInbox(repos: inboxRepos, account: who)
-            inbox = Self.applyDismissed(got, dismissed: store.dismissedPings)
+            inbox = Self.applyDismissed(Self.excludeTracked(got, tracked: trackedPRs),
+                                        dismissed: store.dismissedPings)
             inboxAt = Date()
             inboxError = nil
         } catch let e {
@@ -1437,8 +1467,8 @@ final class Model: ObservableObject {
         let gone = store.projects.remove(at: i).id
         liveByProject[gone] = nil     // 缓存跟着项目走，别留孤儿
         fetchedAt[gone] = nil
+        errorByProject[gone] = nil
         store.selected = store.projects.first?.id
-        error = nil
         save()
         if let now = store.selected, liveByProject[now] == nil {
             Task { await self.refresh() }
@@ -1447,15 +1477,37 @@ final class Model: ObservableObject {
 
     // MARK: 拉取
 
-    func refresh() async {
-        guard let p = project, !p.repo.isEmpty else {
-            if let pid = project?.id { liveByProject[pid] = [:]; error = nil }
+    /// 刷新所有项目 + 评审清单。
+    ///
+    /// 为什么不只刷当前那个：切到别的项目、或者切到评审视角时总得再等一次，
+    /// 而且切换按钮上的待办数会一直是旧的 —— 那个数字要有用，就得一直是准的。
+    /// 各项目并发拉（每个项目一次请求，慢在握手，并发起来总耗时约等于最慢的那一个）。
+    func refreshEverything() async {
+        let pids = store.projects.map(\.id)
+        await withTaskGroup(of: Void.self) { group in
+            for pid in pids { group.addTask { @MainActor in await self.refresh(pid) } }
+            group.addTask { @MainActor in await self.refreshInbox() }
+        }
+    }
+
+    /// 界面上只有一个「在忙」的指示：任何一件事在拉就转圈
+    var busy: Bool { loading || inboxLoading }
+
+    func refresh() async { await refresh(store.selected) }
+
+    func refresh(_ target: UUID?) async {
+        guard let p = store.projects.first(where: { $0.id == target }), !p.repo.isEmpty else {
+            if let pid = target { liveByProject[pid] = [:]; errorByProject[pid] = nil }
             return
         }
         let pid = p.id
-        if loading { return }
+        if inFlight.contains(pid) { return }
+        inFlight.insert(pid)
         loading = true
-        defer { loading = false }
+        defer {
+            inFlight.remove(pid)
+            loading = !inFlight.isEmpty
+        }
 
         // 状态和「我的 PR」搜索挤在同一次请求里 —— 慢的是握手不是数据量，见 fetchAll
         let numbers = p.nodes.allPRNumbers
@@ -1463,20 +1515,20 @@ final class Model: ObservableObject {
         guard !numbers.isEmpty || !(who ?? "").isEmpty else {
             // 一个 PR 都没有、也不用自动导入：记成「拉过了」，免得每次切回来都白试一次
             liveByProject[pid] = [:]
-            error = nil
+            errorByProject[pid] = nil
             return
         }
         do {
             let r = try await Self.fetchAll(repo: p.repo, numbers: numbers, account: who)
             liveByProject[pid] = r.live
             fetchedAt[pid] = Date()
-            error = nil
+            errorByProject[pid] = nil
             fixBackportParents(in: pid, titles: r.live.mapValues(\.title))
             // 导入放在后面：搜索结果跟状态是同一次请求带回来的，不用再跑一趟。
             // 新导进来的这一批要等下一拍才有状态 —— 换一次往返（5 秒）不值。
             if !r.found.isEmpty { importFound(r.found, into: pid) }
         } catch let e {
-            error = e.localizedDescription
+            errorByProject[pid] = e.localizedDescription
         }
     }
 
@@ -1714,10 +1766,7 @@ final class Model: ObservableObject {
                     + "{ nodes { ... on PullRequest { \(fields) } } }"
             }
         }
-        let out = try await run(gh, ["api", "graphql", "-f", "query=query {\(body) }"])
-        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
-            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
-        }
+        let obj = try await graphql(gh, body)
         let data = (obj["data"] as? [String: Any]) ?? [:]
 
         var raw: [ReviewItem] = []
@@ -1825,7 +1874,7 @@ final class Model: ObservableObject {
                     base: wr["head_branch"] as? String ?? "",
                     isDraft: false, review: nil, ci: "PENDING",
                     at: (wr["created_at"] as? String).flatMap(GhParse.date(from:)),
-                    note: note))
+                    note: note, queried: repo))
             }
         }
         return out
@@ -1939,10 +1988,33 @@ final class Model: ObservableObject {
             review: d["reviewDecision"] as? String,
             ci: CheckRollup.state(contexts: contexts, suites: suites),
             at: ping ?? mine.max() ?? fallback,
-            note: "", pingedAt: ping)
+            note: "", queried: repo, pingedAt: ping)
     }
 
-    /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，
+    /// 发一条 GraphQL，抽风就重试一次。
+    ///
+    /// GitHub 偶尔回 5xx，这条网络本身也不稳（TLS 握手要好几秒）。
+    /// 所有项目并发刷新之后更容易撞上 —— 一个项目挂了整块就空了，
+    /// 而重试一次的代价只在真失败的时候才付。
+    private nonisolated static func graphql(_ gh: String, _ body: String) async throws -> [String: Any] {
+        var last: Error = AppError("gh 调用失败")
+        for attempt in 0..<2 {
+            do {
+                let out = try await run(gh, ["api", "graphql", "-f", "query=query {\(body) }"])
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8))
+                        as? [String: Any] else {
+                    throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
+                }
+                return obj
+            } catch {
+                last = error
+                if attempt == 0 { try? await Task.sleep(nanoseconds: 1_500_000_000) }
+            }
+        }
+        throw last
+    }
+
+    /// 分支保护的必过项，按 repo@branch 缓存    /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，
     /// 每次刷新都去问一遍纯属浪费（一次请求要 3–5 秒）。缓存活到进程退出。
     private final class RequiredCache: @unchecked Sendable {
         private let lock = NSLock()
@@ -2011,10 +2083,7 @@ final class Model: ObservableObject {
         }
         guard !body.isEmpty else { return ([:], []) }
 
-        let out = try await run(gh, ["api", "graphql", "-f", "query=query {\(body) }"])
-        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
-            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
-        }
+        let obj = try await graphql(gh, body)
         let data = (obj["data"] as? [String: Any]) ?? [:]
 
         var live: [Int: LivePR] = [:]
@@ -2305,22 +2374,34 @@ struct ContentView: View {
                 .keyboardShortcut(.cancelAction)
                 Text("设置").font(.headline)
                 Spacer()
+            } else if page == .review {
+                // 评审视角是跨仓库的一份清单，跟「当前是哪个项目」无关 ——
+                // 这时候还摆着项目标签会让人以为清单被它过滤了
+                HStack(spacing: 8) {
+                    Image(systemName: "eyeglasses").foregroundColor(.accentColor)
+                    Text("谁在等我").font(.headline)
+                    Text(verbatim: "\(m.inboxRepos.count) 个仓库")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+                actions
             } else {
                 projectTabs
-                if page == .review { inboxActions } else { boardActions }
+                actions
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
     }
 
-    var boardActions: some View {
+    /// 操作区。两个视角共用一条 —— 切换按钮就摆在刷新和设置中间。
+    var actions: some View {
         HStack(spacing: 10) {
             // 时间戳与刷新按钮分开摆，别挤成一坨
             Group {
-                if m.loading {
+                if m.busy {
                     ProgressView().controlSize(.small)
-                } else if let t = m.updatedAt {
+                } else if let t = page == .review ? m.inboxAt : m.updatedAt {
                     Text("更新于 " + t.formatted(date: .omitted, time: .shortened))
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -2328,23 +2409,29 @@ struct ContentView: View {
             }
             .frame(minWidth: 76, alignment: .trailing)   // 宽度固定，刷新时按钮不会左右跳
 
-            Button { Task { await m.refresh() } } label: {
+            // 一次刷新把**所有项目 + 两个视角**都刷了 —— 分开刷的话，
+            // 切过去总要再等一次，而且标签上的待办数会是旧的
+            Button { Task { await m.refreshEverything() } } label: {
                 Image(systemName: "arrow.clockwise")
                     .frame(width: 16, height: 16)
             }
             .buttonStyle(.bordered)
-            .disabled(m.loading)
-            .help("立即刷新")
+            .disabled(m.busy)
+            .help("刷新所有项目和评审清单")
             .tourTarget(.refreshButton)
 
-            Button(m.editing ? "完成" : "编辑") {
-                m.editing.toggle()
-                m.save()
+            perspectiveButton
+
+            if page != .review {
+                Button(m.editing ? "完成" : "编辑") {
+                    m.editing.toggle()
+                    m.save()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(m.editing ? .green : .accentColor)
+                .help(m.editing ? "退出编辑，冻结布局" : "进入编辑，可拖动、增删")
+                .tourTarget(.editButton)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(m.editing ? .green : .accentColor)
-            .help(m.editing ? "退出编辑，冻结布局" : "进入编辑，可拖动、增删")
-            .tourTarget(.editButton)
 
             Button { page = .settings } label: {
                 Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
@@ -2358,6 +2445,33 @@ struct ContentView: View {
         .fixedSize()   // 按钮区不被标签挤压
     }
 
+    /// 视角切换。两个视角是两套东西 —— 贡献视角只有我写的 PR，评审视角只有别人等我的事，
+    /// 所以做成一个「换个身份看」的开关，而不是并列的第 N 个项目标签。
+    var perspectiveButton: some View {
+        let toReview = page != .review
+        return Button {
+            page = toReview ? .review : .board
+        } label: {
+            Label(toReview ? "切换到评审视角" : "切换回贡献视角",
+                  systemImage: toReview ? "eyeglasses" : "arrow.uturn.left")
+        }
+        .buttonStyle(.bordered)
+        // 待办数只在贡献视角显示：已经在评审视角里了，数字就在眼前，气泡纯属重复
+        .overlay(alignment: .topTrailing) {
+            if toReview, !m.inbox.isEmpty {
+                Text(verbatim: "\(m.inbox.count)")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(m.inboxUrgent ? Color.orange : Color.red))
+                    .offset(x: 6, y: -7)
+            }
+        }
+        .help(toReview ? "看谁在等我" : "回到我自己的 PR")
+    }
+
+    // MARK: 项目标签
     // MARK: 项目标签
 
     var projectTabs: some View {
@@ -2373,7 +2487,6 @@ struct ContentView: View {
                     if m.editing { TabGap(index: i) }
                     tab(p)
                 }
-                reviewTab
                 if m.editing {
                     TabGap(index: m.store.projects.count)   // 末尾那条缝
                     Button {
@@ -2391,66 +2504,6 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)   // 标签占满剩余宽度，按钮靠右
         .tourTarget(.projectTabs)
-    }
-
-    /// reviewer 视角的入口，挂在项目标签后面 —— 它跟项目是并列的两种看法：
-    /// 项目标签看「我写的 PR 排到哪了」，这个看「谁在等我」
-    var reviewTab: some View {
-        let on = page == .review
-        let urgent = m.inbox.filter { $0.kind == .approveCI }.count
-        let todo = m.inbox.count
-        return HStack(spacing: 5) {
-            Image(systemName: "eyeglasses")
-            if todo > 0 {
-                Text(verbatim: "\(todo)")
-                    .font(.caption).fontWeight(.semibold)
-                    .padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(Capsule().fill(urgent > 0 ? Color.orange : Color.accentColor))
-                    .foregroundColor(.white)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 5)
-        .background(RoundedRectangle(cornerRadius: 6)
-            .fill(on ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.12)))
-        .overlay(RoundedRectangle(cornerRadius: 6)
-            .stroke(on ? Color.accentColor : .clear, lineWidth: 1))
-        .foregroundColor(on ? .accentColor : .primary)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            page = .review
-            // 没拉过就拉一次；拉过了就用缓存，跟切项目标签一个道理
-            if m.inboxAt == nil { Task { await m.refreshInbox() } }
-        }
-        .help("谁在等我 review")
-    }
-
-    var inboxActions: some View {
-        HStack(spacing: 10) {
-            Group {
-                if m.inboxLoading {
-                    ProgressView().controlSize(.small)
-                } else if let t = m.inboxAt {
-                    Text("更新于 " + t.formatted(date: .omitted, time: .shortened))
-                        .font(.caption).foregroundColor(.secondary)
-                }
-            }
-            .frame(minWidth: 76, alignment: .trailing)
-            Button { Task { await m.refreshInbox() } } label: {
-                Image(systemName: "arrow.clockwise").frame(width: 16, height: 16)
-            }
-            .buttonStyle(.bordered)
-            .disabled(m.inboxLoading)
-            .help("立即刷新")
-            Button { page = .settings } label: {
-                Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
-                    .frame(width: 16, height: 16)
-                    .foregroundColor(m.gh.ready ? .primary : .orange)
-            }
-            .buttonStyle(.bordered)
-            .help("设置")
-        }
-        .fixedSize()
     }
 
     /// 导览用的假标签：只有样子，点不动

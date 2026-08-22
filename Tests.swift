@@ -856,6 +856,25 @@ struct Tests {
             check(false, "缺字段的老文件应该能读")
         }
 
+        // --- 两个视角是两套东西：看板已经在跟的，评审清单里不再出现 ---
+        // 主要挡的是机器人代建的 backport：作者是 bot、把我设成 assignee，
+        // 看板按 assignee 把它导进来当我的贡献，评审清单按 assignee:@me 也会搜到它
+        func tracked(_ kind: ReviewItem.Kind, repo: String, queried: String, _ n: Int) -> ReviewItem {
+            ReviewItem(kind: kind, repo: repo, number: n, title: "t", url: "u", author: "bot",
+                       base: "main", isDraft: false, review: nil, ci: nil, at: nil,
+                       note: "", queried: queried)
+        }
+        let onBoard = tracked(.assigned, repo: "o/a", queried: "o/a", 7)
+        check(Model.excludeTracked([onBoard], tracked: ["o/a#7"]).isEmpty, "看板在跟的不进评审清单")
+        check(Model.excludeTracked([onBoard], tracked: ["o/a#8"]).count == 1, "别的编号不受影响")
+        check(Model.excludeTracked([onBoard], tracked: []).count == 1, "看板没跟的照常显示")
+        // 仓库改过名：看板存的是旧名，GitHub 返回新名 —— 得按查询时的名字对账
+        let renamedItem = tracked(.assigned, repo: "apache/maka", queried: "maka-agent/maka-agent", 7)
+        check(Model.excludeTracked([renamedItem], tracked: ["maka-agent/maka-agent#7"]).isEmpty,
+              "仓库改过名时按配置里的旧名对账，不会漏掉")
+        check(Model.excludeTracked([renamedItem], tracked: ["apache/maka#7"]).isEmpty,
+              "按新名也认")
+
         check(GhParse.date(from: "2026-08-20T06:14:00Z") != nil, "解析 ISO8601 时间戳")
         check(GhParse.date(from: "不是时间") == nil, "解析不了就返回 nil")
     }
