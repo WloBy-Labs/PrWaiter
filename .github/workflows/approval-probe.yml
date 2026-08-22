@@ -1,0 +1,10 @@
+name: Approval Probe
+on:
+  pull_request:
+    paths: ['.github/workflows/approval-probe.yml']
+jobs:
+  gated:
+    runs-on: ubuntu-latest
+    environment: approval-probe
+    steps:
+      - run: echo ok
