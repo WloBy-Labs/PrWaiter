@@ -522,6 +522,11 @@ enum GhParse {
         return nil
     }
 
+    /// GitHub 的时间戳一律是 ISO8601（`2026-08-20T06:14:00Z`）
+    static func date(from iso: String) -> Date? {
+        ISO8601DateFormatter().date(from: iso)
+    }
+
     /// 标题里所有的 backport 引用，按出现顺序。
     /// StarRocks 的 mergify 会生成 "…… (backport #77408)"，其他仓库常见
     /// "backport of #123" / "cherry-pick #123"，都收进来。
@@ -580,6 +585,65 @@ struct LivePR {
     var isDraft = false
     var review: String? // APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
+}
+
+/// reviewer 视角里的一行：**别人卡在我这里的一件事**。
+///
+/// 这一页只放「我不动，别人就推不下去」的东西。所以：
+/// - 我自己的 PR 不在这儿（那是看板那边的事），列表一律排除 `author:@me`
+/// - 我已经 review 完、批准了的也不在这儿 —— 球在作者那边，我不是瓶颈了
+///
+/// 这么定的目的很实际：GitHub 的邮件多到根本看不完，别人的流程卡在我这里
+/// 往往是因为那封邮件被埋了。这一页就是那份「别人在等我」的清单。
+struct ReviewItem: Identifiable {
+    enum Kind {
+        case approveCI      // workflow / 部署卡着等我批，作者干等
+        case requested      // 指名（或按团队）请我 review
+        case assigned       // 别人的 PR 指派给我
+        case mentioned      // 有人 @ 我，等我回话
+
+        /// 越靠前越该先处理
+        var rank: Int {
+            switch self {
+            case .approveCI: return 0
+            case .requested: return 1
+            case .assigned: return 2
+            case .mentioned: return 3
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .approveCI: return "等我批准"
+            case .requested: return "请我 review"
+            case .assigned: return "指派给我"
+            case .mentioned: return "@ 到我"
+            }
+        }
+    }
+
+    let kind: Kind
+    let repo: String        // owner/name，跨仓库清单得显示是哪个
+    let number: Int         // 0 表示这条挂不到具体 PR 上（fork 的 workflow run 有时拿不到 PR）
+    let title: String
+    let url: String
+    let author: String
+    let base: String
+    let isDraft: Bool
+    let review: String?
+    let ci: String?
+    /// 别人开始等我的时间（被请求 review / 被指派 / run 挂起）；拿不到就退回更新时间
+    let at: Date?
+    /// 等我批准的补充说明，比如卡在哪个环境
+    let note: String
+
+    var id: String { number > 0 ? "\(repo)#\(number)" : "\(repo)!\(url)" }
+
+    func with(kind: Kind) -> ReviewItem {
+        ReviewItem(kind: kind, repo: repo, number: number, title: title, url: url,
+                   author: author, base: base, isDraft: isDraft, review: review, ci: ci,
+                   at: at, note: note)
+    }
 }
 
 /// 从 check 明细自己算 CI 结论。
@@ -1071,6 +1135,9 @@ final class Model: ObservableObject {
         if !Prefs.tutorialDoneFlag { tourIndex = 0 }
         Task { await self.refresh() }
         Task { await self.detectToolchain() }
+        // 启动时也拉一次 reviewer 清单：标签上那个数字得一打开就是准的，
+        // 否则「有人在等我」这件事要点进去才知道，等于白做
+        Task { await self.refreshInbox() }
         if Prefs.autoCheckUpdateOn {
             Task { await self.checkForUpdate(auto: true) }
         }
@@ -1084,7 +1151,11 @@ final class Model: ObservableObject {
         let seconds = Prefs.interval
         guard seconds > 0 else { return }
         timer = Timer.scheduledTimer(withTimeInterval: Double(seconds), repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.refresh() }
+            Task { @MainActor in
+                await self?.refresh()
+                // 打开过 reviewer 视角才跟着刷 —— 没用过的话不白花一次请求（一次要 5–9 秒）
+                if self?.inboxAt != nil { await self?.refreshInbox() }
+            }
         }
     }
 
@@ -1211,6 +1282,38 @@ final class Model: ObservableObject {
               let moved = Tree.move(dragged, toRootIndex: index, in: store.projects[i].nodes) else { return }
         store.projects[i].nodes = moved
         save()
+    }
+
+    // MARK: reviewer 视角
+
+    /// 别人请我 review 的清单。跟看板分开缓存 —— 切过去不用重新拉
+    @Published var inbox: [ReviewItem] = []
+    @Published var inboxAt: Date?
+    @Published var inboxLoading = false
+    @Published var inboxError: String?
+
+    /// 只查已配置的项目仓库（去重）—— 跨全网的 review 请求先不管，
+    /// 你关心的就是这几个仓库
+    var inboxRepos: [String] {
+        var seen = Set<String>()
+        return store.projects.map(\.repo).filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    func refreshInbox() async {
+        guard !inboxLoading else { return }
+        guard let who = gh.account, !who.isEmpty else {
+            inboxError = "还没登录 gh，到设置里点「在终端登录」"
+            return
+        }
+        inboxLoading = true
+        defer { inboxLoading = false }
+        do {
+            inbox = try await Self.fetchReviewInbox(repos: inboxRepos, account: who)
+            inboxAt = Date()
+            inboxError = nil
+        } catch let e {
+            inboxError = e.localizedDescription
+        }
     }
 
     // MARK: 上手导览
@@ -1501,6 +1604,196 @@ final class Model: ObservableObject {
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = [script.path]
         try p.run()   // 不 wait：它要活过本进程
+    }
+
+    /// 拉 reviewer 视角的清单：**别人卡在我这里的事**。
+    ///
+    /// 三类靠一次 GraphQL 搜索拿到（请我 review / 指派给我 / @ 到我），
+    /// 一律排除 `author:@me` —— 我自己的 PR 归看板那边管。
+    ///
+    /// 「等我批准 workflow」得单独查：随便一个贡献者的 fork PR 卡着等我批，
+    /// 没人会请我 review，搜索里根本看不到它。而且只有我有 write 权限的仓库才查得着 ——
+    /// 批 workflow 要写权限，只读仓库连查都不用查（省一次 5 秒的请求）。
+    nonisolated static func fetchReviewInbox(repos: [String], account: String)
+        async throws -> [ReviewItem]
+    {
+        guard let gh = ghPath() else {
+            throw AppError("找不到 GitHub CLI（gh），到设置里可以一键安装")
+        }
+        let valid = repos.filter { $0.range(of: #"^[\w.-]+/[\w.-]+$"#, options: .regularExpression) != nil }
+        guard !valid.isEmpty, !account.isEmpty else { return [] }
+
+        // 被请求 review 的确切时间要从 timeline 里取 —— 只按 PR 更新时间排序会把
+        // 「三天前请我、刚被作者推了一版」排到「十分钟前请我」前面
+        let prFields = """
+        number title url isDraft updatedAt reviewDecision baseRefName \
+        author { login } repository { nameWithOwner } \
+        timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT, ASSIGNED_EVENT], last: 20) { nodes { \
+          ... on ReviewRequestedEvent { createdAt requestedReviewer { \
+            ... on User { login } ... on Team { name } } } \
+          ... on AssignedEvent { createdAt assignee { ... on User { login } } } } } \
+        commits(last: 1) { nodes { commit { \
+          statusCheckRollup { contexts(last: 100) { nodes { \
+            __typename \
+            ... on CheckRun { name status conclusion startedAt } \
+            ... on StatusContext { context state createdAt } \
+          } } } \
+          checkSuites(first: 50) { nodes { status } } } } }
+        """
+        let kinds: [(String, String, ReviewItem.Kind)] = [
+            ("req", "review-requested:\(account)", .requested),
+            ("asg", "assignee:\(account)", .assigned),
+            ("men", "mentions:\(account)", .mentioned),
+        ]
+        var body = ""
+        for (i, repo) in valid.enumerated() {
+            let parts = repo.split(separator: "/")
+            body += " perm\(i): repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { viewerPermission }"
+            for (tag, term, _) in kinds {
+                body += " \(tag)\(i): search(query: \"repo:\(repo) is:pr is:open -author:\(account) "
+                    + "\(term) sort:updated-desc\", type: ISSUE, first: 30) "
+                    + "{ nodes { ... on PullRequest { \(prFields) } } }"
+            }
+        }
+        let out = try await run(gh, ["api", "graphql", "-f", "query=query {\(body) }"])
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any] else {
+            throw AppError(out.stderr.isEmpty ? "gh 调用失败" : out.stderr)
+        }
+        let data = (obj["data"] as? [String: Any]) ?? [:]
+
+        var raw: [ReviewItem] = []
+        var writable: [String] = []
+        for (i, repo) in valid.enumerated() {
+            let perm = ((data["perm\(i)"] as? [String: Any])?["viewerPermission"] as? String) ?? "READ"
+            if ["WRITE", "MAINTAIN", "ADMIN"].contains(perm) { writable.append(repo) }
+            for (tag, _, kind) in kinds {
+                let nodes = ((data["\(tag)\(i)"] as? [String: Any])?["nodes"] as? [[String: Any]]) ?? []
+                for d in nodes {
+                    if let it = parseReviewItem(d, repo: repo, kind: kind, account: account) {
+                        raw.append(it)
+                    }
+                }
+            }
+        }
+
+        // 有写权限的仓库才去看「谁的 workflow 卡着等我批」
+        await withTaskGroup(of: [ReviewItem].self) { group in
+            for repo in writable {
+                group.addTask { await pendingApprovals(gh: gh, repo: repo, account: account) }
+            }
+            for await items in group { raw += items }
+        }
+        return arrange(raw)
+    }
+
+    /// 卡在等人批准的 workflow run，且**我批得动**的那些。
+    ///
+    /// 两种形态，都试：
+    /// - 环境审批：run 处于 `waiting`，`pending_deployments` 会直说 `current_user_can_approve`
+    /// - fork 首次贡献者：run 处于 `action_required` 且 `conclusion` 还是 null
+    ///   （注意 `status=action_required` 也会捞到一堆「跑完了、结论是 action_required」的历史 run，
+    ///   实测某仓库有 1148 个，必须靠 conclusion == null 筛掉）
+    private nonisolated static func pendingApprovals(gh: String, repo: String, account: String)
+        async -> [ReviewItem]
+    {
+        var out: [ReviewItem] = []
+        for status in ["waiting", "action_required"] {
+            guard let r = try? await run(gh, ["api", "repos/\(repo)/actions/runs?status=\(status)&per_page=30"]),
+                  let obj = try? JSONSerialization.jsonObject(with: Data(r.stdout.utf8)) as? [String: Any],
+                  let runs = obj["workflow_runs"] as? [[String: Any]] else { continue }
+
+            for wr in runs where wr["conclusion"] is NSNull || wr["conclusion"] == nil {
+                guard let id = wr["id"] as? Int else { continue }
+                let actor = ((wr["triggering_actor"] as? [String: Any])?["login"] as? String)
+                    ?? ((wr["actor"] as? [String: Any])?["login"] as? String) ?? ""
+                // 自己触发的不算「别人卡在我这里」—— 那是我自己的事，看板那边看
+                if actor == account { continue }
+
+                var note = ""
+                if status == "waiting" {
+                    // 只有 pending_deployments 能回答「这个是不是等我批」
+                    guard let pd = try? await run(gh, ["api", "repos/\(repo)/actions/runs/\(id)/pending_deployments"]),
+                          let list = try? JSONSerialization.jsonObject(with: Data(pd.stdout.utf8)) as? [[String: Any]]
+                    else { continue }
+                    let mine = list.filter { ($0["current_user_can_approve"] as? Bool) == true }
+                    guard !mine.isEmpty else { continue }
+                    note = mine.compactMap { ($0["environment"] as? [String: Any])?["name"] as? String }
+                        .joined(separator: "、")
+                } else {
+                    note = "首次贡献者，需要批准才会跑"
+                }
+
+                let prs = wr["pull_requests"] as? [[String: Any]] ?? []
+                out.append(ReviewItem(
+                    kind: .approveCI, repo: repo,
+                    number: prs.first?["number"] as? Int ?? 0,
+                    title: wr["display_title"] as? String ?? wr["name"] as? String ?? "workflow",
+                    url: wr["html_url"] as? String ?? "",
+                    author: actor,
+                    base: wr["head_branch"] as? String ?? "",
+                    isDraft: false, review: nil, ci: "PENDING",
+                    at: (wr["created_at"] as? String).flatMap(GhParse.date(from:)),
+                    note: note))
+            }
+        }
+        return out
+    }
+
+    /// 去重 + 排序。纯函数，方便单测。
+    ///
+    /// 同一个 PR 可能同时命中几个搜索（请我 review + 指派给我 + @ 到我），
+    /// 留最该办的那一档就行 —— 一件事在清单里出现三次只是噪音。
+    nonisolated static func arrange(_ items: [ReviewItem]) -> [ReviewItem] {
+        var byID: [String: ReviewItem] = [:]
+        for it in items {
+            if let old = byID[it.id], old.kind.rank <= it.kind.rank { continue }
+            byID[it.id] = it
+        }
+        return byID.values.sorted {
+            $0.kind.rank != $1.kind.rank ? $0.kind.rank < $1.kind.rank
+                : ($0.at ?? .distantPast) > ($1.at ?? .distantPast)
+        }
+    }
+
+    nonisolated static func parseReviewItem(
+        _ d: [String: Any], repo: String, kind: ReviewItem.Kind, account: String
+    ) -> ReviewItem? {
+        guard let n = d["number"] as? Int else { return nil }
+        let commit = ((d["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
+            .first?["commit"] as? [String: Any]
+        let rollup = commit?["statusCheckRollup"] as? [String: Any]
+        let contexts = ((rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? [])
+            .map(CheckRollup.Item.init(json:))
+        let suites = ((commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? [])
+            .compactMap { $0["status"] as? String }
+
+        // 「别人从什么时候开始等我」：请我 review / 把我设成 assignee 的那一刻。
+        // 团队请求没有 login，也算我（大仓库多半按团队派 review）。
+        let events = ((d["timelineItems"] as? [String: Any])?["nodes"] as? [[String: Any]]) ?? []
+        let mine = events.compactMap { e -> Date? in
+            let who = ((e["requestedReviewer"] as? [String: Any])?["login"] as? String)
+                ?? ((e["assignee"] as? [String: Any])?["login"] as? String)
+            guard who == nil || who == account else { return nil }
+            return (e["createdAt"] as? String).flatMap(GhParse.date(from:))
+        }
+        let fallback = (d["updatedAt"] as? String).flatMap(GhParse.date(from:))
+
+        // 仓库名以响应里的为准，不用查询时填的那个 —— 仓库改名 / 转移之后
+        // GitHub 会重定向，用旧名照样查得到，但显示旧名会让人对不上号
+        // （实测配置里的 maka-agent/maka-agent 现在已经是 apache/maka）
+        let real = ((d["repository"] as? [String: Any])?["nameWithOwner"] as? String) ?? repo
+
+        return ReviewItem(
+            kind: kind, repo: real, number: n,
+            title: d["title"] as? String ?? "",
+            url: d["url"] as? String ?? "",
+            author: (d["author"] as? [String: Any])?["login"] as? String ?? "",
+            base: d["baseRefName"] as? String ?? "",
+            isDraft: d["isDraft"] as? Bool ?? false,
+            review: d["reviewDecision"] as? String,
+            ci: CheckRollup.state(contexts: contexts, suites: suites),
+            at: mine.max() ?? fallback,
+            note: "")
     }
 
     /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，
@@ -1804,7 +2097,7 @@ struct ContentView: View {
     }
 
     /// 设置不再弹窗，而是主区域里换一页 —— 看板和设置是同一个界面的两个页面
-    enum Page { case board, settings }
+    enum Page { case board, review, settings }
 
     static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
@@ -1817,6 +2110,8 @@ struct ContentView: View {
             switch page {
             case .board:
                 boardPage
+            case .review:
+                InboxView().environmentObject(m)
             case .settings:
                 SettingsView().environmentObject(m)
             }
@@ -1866,7 +2161,7 @@ struct ContentView: View {
                 Spacer()
             } else {
                 projectTabs
-                boardActions
+                if page == .review { inboxActions } else { boardActions }
             }
         }
         .padding(.horizontal, 14)
@@ -1932,6 +2227,7 @@ struct ContentView: View {
                     if m.editing { TabGap(index: i) }
                     tab(p)
                 }
+                reviewTab
                 if m.editing {
                     TabGap(index: m.store.projects.count)   // 末尾那条缝
                     Button {
@@ -1949,6 +2245,66 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)   // 标签占满剩余宽度，按钮靠右
         .tourTarget(.projectTabs)
+    }
+
+    /// reviewer 视角的入口，挂在项目标签后面 —— 它跟项目是并列的两种看法：
+    /// 项目标签看「我写的 PR 排到哪了」，这个看「谁在等我」
+    var reviewTab: some View {
+        let on = page == .review
+        let urgent = m.inbox.filter { $0.kind == .approveCI }.count
+        let todo = m.inbox.count
+        return HStack(spacing: 5) {
+            Image(systemName: "eyeglasses")
+            if todo > 0 {
+                Text(verbatim: "\(todo)")
+                    .font(.caption).fontWeight(.semibold)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(urgent > 0 ? Color.orange : Color.accentColor))
+                    .foregroundColor(.white)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 6)
+            .fill(on ? Color.accentColor.opacity(0.2) : Color.gray.opacity(0.12)))
+        .overlay(RoundedRectangle(cornerRadius: 6)
+            .stroke(on ? Color.accentColor : .clear, lineWidth: 1))
+        .foregroundColor(on ? .accentColor : .primary)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            page = .review
+            // 没拉过就拉一次；拉过了就用缓存，跟切项目标签一个道理
+            if m.inboxAt == nil { Task { await m.refreshInbox() } }
+        }
+        .help("谁在等我 review")
+    }
+
+    var inboxActions: some View {
+        HStack(spacing: 10) {
+            Group {
+                if m.inboxLoading {
+                    ProgressView().controlSize(.small)
+                } else if let t = m.inboxAt {
+                    Text("更新于 " + t.formatted(date: .omitted, time: .shortened))
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .frame(minWidth: 76, alignment: .trailing)
+            Button { Task { await m.refreshInbox() } } label: {
+                Image(systemName: "arrow.clockwise").frame(width: 16, height: 16)
+            }
+            .buttonStyle(.bordered)
+            .disabled(m.inboxLoading)
+            .help("立即刷新")
+            Button { page = .settings } label: {
+                Image(systemName: m.gh.ready ? "gearshape" : "gearshape.badge.checkmark")
+                    .frame(width: 16, height: 16)
+                    .foregroundColor(m.gh.ready ? .primary : .orange)
+            }
+            .buttonStyle(.bordered)
+            .help("设置")
+        }
+        .fixedSize()
     }
 
     /// 导览用的假标签：只有样子，点不动
@@ -2189,6 +2545,170 @@ struct ContentView: View {
 
 /// 用原生 Form + grouped 样式：标签在左、控件在右，随窗口宽度自适应，
 /// 不用自己拍一个 maxWidth 的魔数。这也是 macOS 系统设置的排版方式。
+// MARK: - reviewer 视角
+//
+// 这一页跟看板刻意长得不一样：没有树、没有拖拽、不能编辑。
+// 别人的 PR 我管不着合并顺序，只需要一份「谁在等我」的清单，从上到下办完就行。
+
+struct InboxView: View {
+    @EnvironmentObject var m: Model
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                if let e = m.inboxError {
+                    Label(e, systemImage: "exclamationmark.triangle")
+                        .foregroundColor(.red)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.1)))
+                        .padding(.bottom, 10)
+                }
+                section(.approveCI, "等我批准", "workflow 不批就永远不跑，作者在那边干等")
+                section(.requested, "请我 review", "指名请我看的，最近请求的排在上面")
+                section(.assigned, "指派给我", "别人建的 PR 把我设成了负责人")
+                section(.mentioned, "@ 到我", "有人在 PR 里点了我，等我回话")
+
+                if m.inbox.isEmpty && !m.inboxLoading && m.inboxError == nil {
+                    empty
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    func section(_ kind: ReviewItem.Kind, _ title: String, _ hint: String) -> some View {
+        let rows = m.inbox.filter { $0.kind == kind }
+        if !rows.isEmpty {
+            HStack(spacing: 8) {
+                Text(title).font(.headline)
+                Text(verbatim: "\(rows.count)")
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Text(hint).font(.caption).foregroundColor(.secondary)
+            }
+            .padding(.top, 4)
+            .padding(.bottom, 6)
+            ForEach(rows) { InboxRow(item: $0) }
+            Spacer().frame(height: 14)
+        }
+    }
+
+    /// 空清单不是「出错了」，得说清楚为什么空 —— 尤其是批 workflow 那一档，
+    /// 只读权限下永远是空的，不解释一句会让人以为坏了
+    var empty: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("现在没人等你").font(.title3).foregroundColor(.secondary)
+            Text("这里只看已配置的那几个项目仓库：" + m.inboxRepos.joined(separator: "、"))
+                .font(.caption).foregroundColor(.secondary)
+            if m.inboxRepos.isEmpty {
+                Text("还没有填过 owner/repo，先去看板那边配一个项目。")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .padding(.top, 30)
+    }
+}
+
+struct InboxRow: View {
+    @EnvironmentObject var m: Model
+    let item: ReviewItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            Capsule().fill(barColor).frame(width: 3)
+                .padding(.vertical, 8).padding(.leading, 4).padding(.trailing, 8)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    // 跨仓库的清单，仓库名要跟编号一起显示，不然不知道说的是哪个
+                    Text(item.repo.split(separator: "/").last.map(String.init) ?? item.repo)
+                        .font(.caption).foregroundColor(.secondary)
+                    // 编号为 0 是 fork 的 workflow run 拿不到 PR 的情况，
+                    // 那就直接链到 run 本身 —— 反正要点的按钮在那儿
+                    let label = item.number > 0 ? "#\(item.number)" : "run"
+                    if let u = URL(string: item.url) {
+                        Link(destination: u) { Text(verbatim: label) }
+                            .font(.system(.body, design: .monospaced).weight(.semibold))
+                    } else {
+                        Text(verbatim: label)
+                            .font(.system(.body, design: .monospaced).weight(.semibold))
+                    }
+                    Text(item.title).lineLimit(1)
+                    Spacer()
+                    if item.isDraft { tag("草稿", .secondary) }
+                    if item.kind == .approveCI { tag(item.kind.label, .orange) }
+                    ciTag
+                    reviewTag
+                }
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.branch").font(.system(size: 9))
+                    Text(item.base)
+                    Text(verbatim: "·")
+                    Image(systemName: "person").font(.system(size: 9))
+                    Text(verbatim: "@\(item.author)")
+                    if !item.note.isEmpty {
+                        Text(verbatim: "·")
+                        Text(item.note)
+                    }
+                    Spacer(minLength: 8)
+                    if let t = item.at { Text(ago(t)) }
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+            }
+            .padding(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 10))
+        }
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.2)))
+        .padding(.bottom, 6)
+    }
+
+    /// 左侧色条跟看板一个规矩：按「欠在谁身上」分。这一页全是欠在我身上的，
+    /// 所以只分「多急」：等我批准最急（橙），请我 review 次之（蓝），跟进的是灰
+    var barColor: Color {
+        switch item.kind {
+        case .approveCI: return .orange     // 最急：不点一下，别人的 CI 根本不跑
+        case .requested: return .blue       // 等我看
+        case .assigned: return .indigo
+        case .mentioned: return .secondary
+        }
+    }
+
+    @ViewBuilder var ciTag: some View {
+        switch item.ci ?? "" {
+        case "SUCCESS": tag("CI ✓", .green)
+        case "FAILURE", "ERROR": tag("CI ✗", .red)
+        case "PENDING", "EXPECTED": tag("CI …", .orange)
+        default: EmptyView()
+        }
+    }
+
+    @ViewBuilder var reviewTag: some View {
+        switch item.review ?? "" {
+        case "APPROVED": tag("已批准", .green)
+        case "CHANGES_REQUESTED": tag("已要求修改", .red)
+        default: EmptyView()
+        }
+    }
+
+    func tag(_ s: String, _ c: Color) -> some View {
+        Text(s).font(.caption)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(c.opacity(0.15)))
+            .foregroundColor(c)
+    }
+
+    /// 「多久之前」比一个绝对时间戳有用 —— 你关心的是它等了我多久
+    func ago(_ t: Date) -> String {
+        let s = Int(Date().timeIntervalSince(t))
+        if s < 3600 { return "\(max(1, s / 60)) 分钟前" }
+        if s < 86400 { return "\(s / 3600) 小时前" }
+        return "\(s / 86400) 天前"
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var m: Model
     @AppStorage(Prefs.ghPath) private var customPath = ""

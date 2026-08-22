@@ -24,6 +24,7 @@ struct Tests {
         importOrderTests()
         reparentTests()
         projectReorderTests()
+        inboxTests()
         checkRollupTests()
         statusTests()
         migrationTests()
@@ -622,6 +623,112 @@ struct Tests {
 
         // 拉不到标题时不猜
         check(Tree.reparenting([trunk], titles: [:]) == nil, "没有标题就不动")
+    }
+
+    static func inboxTests() {
+        print("reviewer 视角:")
+
+        func item(_ kind: ReviewItem.Kind, _ repo: String, _ n: Int, at: Double = 0) -> ReviewItem {
+            ReviewItem(kind: kind, repo: repo, number: n, title: "t", url: "u", author: "other",
+                       base: "main", isDraft: false, review: nil, ci: nil,
+                       at: Date(timeIntervalSince1970: at), note: "")
+        }
+
+        // --- 分档：等我批准 > 请我 review > 指派给我 > @ 到我 ---
+        // 排序就是「谁被卡得最死」：workflow 不批，对方的 CI 一步都走不了
+        let mixed = [item(.mentioned, "o/a", 1), item(.assigned, "o/a", 2),
+                     item(.requested, "o/a", 3), item(.approveCI, "o/a", 4)]
+        check(Model.arrange(mixed).map(\.number) == [4, 3, 2, 1], "按「卡得多死」排序")
+
+        // --- 同一个 PR 命中多个搜索：只留最该办的那一档 ---
+        let dup = Model.arrange([item(.mentioned, "o/a", 5), item(.requested, "o/a", 5),
+                                 item(.assigned, "o/a", 5)])
+        check(dup.count == 1, "一件事只出现一次")
+        check(dup[0].kind == .requested, "留最该办的那一档")
+        check(Model.arrange([item(.requested, "o/a", 5), item(.mentioned, "o/a", 5)])[0].kind
+              == .requested, "跟先后顺序无关")
+
+        // 不同仓库的同号 PR 是两件事
+        check(Model.arrange([item(.requested, "o/a", 5), item(.requested, "o/b", 5)]).count == 2,
+              "不同仓库的同号 PR 不能被去重掉")
+
+        // 拿不到 PR 编号的 workflow run（fork 的常这样）靠 url 区分，不能互相盖掉
+        let r1 = ReviewItem(kind: .approveCI, repo: "o/a", number: 0, title: "t", url: "run/1",
+                            author: "x", base: "b", isDraft: false, review: nil, ci: nil,
+                            at: nil, note: "")
+        let r2 = ReviewItem(kind: .approveCI, repo: "o/a", number: 0, title: "t", url: "run/2",
+                            author: "x", base: "b", isDraft: false, review: nil, ci: nil,
+                            at: nil, note: "")
+        check(Model.arrange([r1, r2]).count == 2, "没有 PR 编号的 run 按 url 区分")
+
+        // --- 同档之内按时间，等得久的不该被新来的埋掉：新的在上，一眼看到最新请求 ---
+        let byTime = Model.arrange([item(.requested, "o/a", 1, at: 100),
+                                    item(.requested, "o/a", 2, at: 300),
+                                    item(.requested, "o/a", 3, at: 200)])
+        check(byTime.map(\.number) == [2, 3, 1], "同档按时间倒序，刚请我的排最上面")
+
+        // --- 解析：「别人从什么时候开始等我」要从 timeline 取 ---
+        // 三天前请我 review、刚被作者推了一版，不该排到「十分钟前请我」前面
+        let base: [String: Any] = [
+            "number": 42, "title": "别人的 PR", "url": "u", "isDraft": false,
+            "updatedAt": "2026-08-22T02:00:00Z", "baseRefName": "main",
+            "author": ["login": "someone"], "repository": ["nameWithOwner": "o/a"],
+            "commits": ["nodes": [["commit": [
+                "statusCheckRollup": ["contexts": ["nodes": [
+                    ["__typename": "CheckRun", "name": "build", "status": "COMPLETED",
+                     "conclusion": "SUCCESS"],
+                ]]],
+                "checkSuites": ["nodes": [["status": "COMPLETED"]]],
+            ]]]],
+        ]
+        var withReq = base
+        withReq["timelineItems"] = ["nodes": [
+            ["createdAt": "2026-08-19T00:00:00Z", "requestedReviewer": ["login": "someone-else"]],
+            ["createdAt": "2026-08-20T06:14:00Z", "requestedReviewer": ["login": "me"]],
+        ]]
+        let a1 = Model.parseReviewItem(withReq, repo: "o/a", kind: .requested, account: "me")
+        check(a1?.at == GhParse.date(from: "2026-08-20T06:14:00Z"), "取的是请我那次的时间")
+        check(a1?.ci == "SUCCESS", "CI 结论复用同一套算法")
+        check(a1?.author == "someone", "显示的是 PR 作者，也就是在等我的那个人")
+
+        var otherOnly = base
+        otherOnly["timelineItems"] = ["nodes": [
+            ["createdAt": "2026-08-19T00:00:00Z", "requestedReviewer": ["login": "someone-else"]],
+        ]]
+        check(Model.parseReviewItem(otherOnly, repo: "o/a", kind: .requested, account: "me")?.at
+              == GhParse.date(from: "2026-08-22T02:00:00Z"), "只请了别人时退回 PR 更新时间")
+
+        var team = base
+        team["timelineItems"] = ["nodes": [
+            ["createdAt": "2026-08-21T00:00:00Z", "requestedReviewer": ["name": "storage-team"]],
+        ]]
+        check(Model.parseReviewItem(team, repo: "o/a", kind: .requested, account: "me")?.at
+              == GhParse.date(from: "2026-08-21T00:00:00Z"), "按团队请我 review 也算数")
+
+        // 指派给我也算「开始等我」的时刻
+        var asg = base
+        asg["timelineItems"] = ["nodes": [
+            ["createdAt": "2026-08-21T10:00:00Z", "assignee": ["login": "me"]],
+        ]]
+        check(Model.parseReviewItem(asg, repo: "o/a", kind: .assigned, account: "me")?.at
+              == GhParse.date(from: "2026-08-21T10:00:00Z"), "被指派的时间也认")
+
+        // --- 仓库改名：显示响应里的真名 ---
+        // 实测配置里的 maka-agent/maka-agent 已经转移成 apache/maka，
+        // 用旧名照样能查（GitHub 重定向），但显示旧名会让人对不上号
+        var renamed = base
+        renamed["repository"] = ["nameWithOwner": "apache/maka"]
+        let rn = Model.parseReviewItem(renamed, repo: "maka-agent/maka-agent",
+                                       kind: .requested, account: "me")
+        check(rn?.repo == "apache/maka", "改名后的仓库显示新名字")
+        check(rn?.id == "apache/maka#42", "去重的键也跟着用新名字")
+        var noRepo = base
+        noRepo["repository"] = [:] as [String: Any]
+        check(Model.parseReviewItem(noRepo, repo: "o/a", kind: .requested, account: "me")?.repo
+              == "o/a", "响应里没带仓库名时退回查询时填的那个")
+
+        check(GhParse.date(from: "2026-08-20T06:14:00Z") != nil, "解析 ISO8601 时间戳")
+        check(GhParse.date(from: "不是时间") == nil, "解析不了就返回 nil")
     }
 
     static func checkRollupTests() {
