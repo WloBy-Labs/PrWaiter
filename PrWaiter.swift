@@ -706,17 +706,43 @@ enum CheckRollup {
         }
     }
 
+    /// 一个 check suite 的状态。**必须连 conclusion 一起看** ——
+    /// fork PR 等维护者批准 workflow 时，suite 是 `status=COMPLETED` 而
+    /// `conclusion=ACTION_REQUIRED`，光看 status 会当成「跑完了、什么都不会来」。
+    /// 实测 apache/maka 那几个 PR 就是这个形状：0 条 check + 一个这样的 suite。
+    struct Suite {
+        let status: String
+        let conclusion: String
+
+        init(status: String, conclusion: String = "") {
+            self.status = status
+            self.conclusion = conclusion
+        }
+
+        init(json: [String: Any]) {
+            status = json["status"] as? String ?? ""
+            conclusion = json["conclusion"] as? String ?? ""
+        }
+    }
+
     static let pending: Set<String> = ["QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING", "EXPECTED"]
-    static let failed: Set<String> = ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]
+    /// ACTION_REQUIRED 不在这里 —— 那是「等人批准」，不是失败，单独一档
+    static let failed: Set<String> = ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"]
 
     /// - required: 分支保护要求的必过项。**这些里面有一项从来没报上来，CI 就没跑完** ——
     ///   GitHub 界面上那一条「Expected — Waiting for status to be reported」就是它。
     ///   传空集表示不知道（拿不到分支保护，或者这个分支没保护），那就只按已报上来的算。
     ///
     /// nil 表示这个 PR 压根没有 CI（有些仓库就是没配），不是「通过」
-    static func state(contexts: [Item], suites: [String], required: Set<String> = []) -> String? {
+    static func state(contexts: [Item], suites: [Suite], required: Set<String> = []) -> String? {
+        // 等人点「批准运行」：这不是「还在跑」，不点的话一步都不会跑。
+        // 排在最前面判 —— 它是这条流水线的总闸，别的信号都是它后面的事。
+        if suites.contains(where: { $0.conclusion == "ACTION_REQUIRED" })
+            || contexts.contains(where: { $0.state == "ACTION_REQUIRED" }) {
+            return "ACTION_REQUIRED"
+        }
         // 有 suite 正在跑，说明重活还没报完，先说在跑
-        if suites.contains("IN_PROGRESS") { return "PENDING" }
+        if suites.contains(where: { $0.status == "IN_PROGRESS" }) { return "PENDING" }
 
         // 同名只留最新一次尝试 —— 重跑绿了就是绿了，旧的那条红不算数
         var latest: [String: Item] = [:]
@@ -752,6 +778,7 @@ enum PRStatus: CaseIterable {
     case merged, closed, draft
     case ciFailed, changesRequested   // 问题在自己这边，即使被依赖挡着也该先修
     case blocked                      // 上游还没合
+    case needsCIApproval              // workflow 等维护者点批准，不批就一步都不跑
     case ciRunning, needsReview       // 等机器 / 等人
     case ready
     case unknown
@@ -761,6 +788,7 @@ enum PRStatus: CaseIterable {
         case .ready: return "可合并"
         case .ciFailed: return "CI 失败"
         case .changesRequested: return "需修改"
+        case .needsCIApproval: return "CI 等批准"
         case .ciRunning: return "CI 运行中"
         case .needsReview: return "等 review"
         case .blocked: return "等依赖"
@@ -777,6 +805,7 @@ enum PRStatus: CaseIterable {
         switch self {
         case .ready: return .green                        // 可以动了
         case .ciFailed, .changesRequested: return .red    // 欠在你身上，且是坏消息
+        case .needsCIApproval: return .orange             // 欠在维护者身上，得有人点一下
         case .ciRunning: return .orange                   // 欠在机器身上
         case .needsReview: return .blue                   // 欠在别人身上，能去催
         case .blocked: return .indigo                     // 欠在上游那个 PR 身上
@@ -791,6 +820,8 @@ enum PRStatus: CaseIterable {
         case .ready: return "上游全合了、已批准、CI 通过 —— 可以去催了"
         case .ciFailed: return "CI 红了。球在你脚下，所以排在「等依赖」前面"
         case .changesRequested: return "reviewer 要求改动。同样是该你动手"
+        case .needsCIApproval:
+            return "workflow 等维护者点「批准运行」。不批就一步都不跑，别误当成「还在跑」"
         case .ciRunning: return "CI 还在跑，等机器"
         case .needsReview: return "还没人批准，等人"
         case .blocked: return "树上游还有没合并的 PR，先轮不到它"
@@ -806,6 +837,7 @@ enum PRStatus: CaseIterable {
         case .ready: return "checkmark.circle.fill"
         case .ciFailed: return "xmark.octagon.fill"
         case .changesRequested: return "exclamationmark.bubble.fill"
+        case .needsCIApproval: return "hand.raised.fill"
         case .ciRunning: return "clock.arrow.circlepath"
         case .needsReview: return "eye"
         case .blocked: return "hourglass"
@@ -818,7 +850,7 @@ enum PRStatus: CaseIterable {
 
     /// 描述块上分项计数的排列顺序：先给能立刻动的，已完成的排最后
     static let summaryOrder: [PRStatus] = [
-        .ready, .ciFailed, .changesRequested, .ciRunning,
+        .ready, .ciFailed, .changesRequested, .needsCIApproval, .ciRunning,
         .needsReview, .blocked, .draft, .merged, .closed, .unknown,
     ]
 
@@ -1738,7 +1770,7 @@ final class Model: ObservableObject {
             ... on CheckRun { name status conclusion startedAt } \
             ... on StatusContext { context state createdAt } \
           } } } \
-          checkSuites(first: 50) { nodes { status } } } } }
+          checkSuites(first: 50) { nodes { status conclusion } } } } }
         """
         // 「@ 到我」得多要一批时间戳：谁在什么时候点了我、我最后一次发言是什么时候。
         // 只给这一档要 —— 另两档不需要，白拉一堆评论纯属浪费。
@@ -1954,7 +1986,7 @@ final class Model: ObservableObject {
         let contexts = ((rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? [])
             .map(CheckRollup.Item.init(json:))
         let suites = ((commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? [])
-            .compactMap { $0["status"] as? String }
+            .map(CheckRollup.Suite.init(json:))
 
         // 「别人从什么时候开始等我」：请我 review / 把我设成 assignee 的那一刻。
         // 团队请求没有 login，也算我（大仓库多半按团队派 review）。
@@ -2063,7 +2095,7 @@ final class Model: ObservableObject {
             ... on CheckRun { name status conclusion startedAt } \
             ... on StatusContext { context state createdAt } \
           } } } \
-          checkSuites(first: 50) { nodes { status } } } } }
+          checkSuites(first: 50) { nodes { status conclusion } } } } }
         """
         var body = ""
         if !numbers.isEmpty {
@@ -2087,7 +2119,7 @@ final class Model: ObservableObject {
         let data = (obj["data"] as? [String: Any]) ?? [:]
 
         var live: [Int: LivePR] = [:]
-        var checks: [Int: (items: [CheckRollup.Item], suites: [String])] = [:]
+        var checks: [Int: (items: [CheckRollup.Item], suites: [CheckRollup.Suite])] = [:]
         let repoData = (data["repository"] as? [String: Any]) ?? [:]
         for case let v as [String: Any] in Array(repoData.values) {
             guard let n = v["number"] as? Int else { continue }
@@ -2107,7 +2139,7 @@ final class Model: ObservableObject {
             let contexts = (rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
             let suites = (commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
             checks[n] = (contexts.map(CheckRollup.Item.init(json:)),
-                         suites.compactMap { $0["status"] as? String })
+                         suites.map(CheckRollup.Suite.init(json:)))
         }
         // 个别编号不存在时 GraphQL 只报部分错误，能拿到的照常显示；全军覆没才抛错
         if live.isEmpty, !numbers.isEmpty, let errs = obj["errors"] as? [[String: Any]],
@@ -2232,6 +2264,8 @@ final class Model: ObservableObject {
         if lv.ci == "FAILURE" || lv.ci == "ERROR" { return .ciFailed }
         if lv.review == "CHANGES_REQUESTED" { return .changesRequested }
         if blocked { return .blocked }
+        // 等人点批准，不是「等机器」—— 不点的话一步都不会跑
+        if lv.ci == "ACTION_REQUIRED" { return .needsCIApproval }
         if lv.ci == "PENDING" || lv.ci == "EXPECTED" { return .ciRunning }
         if lv.review != "APPROVED" { return .needsReview }
         return .ready
@@ -2906,6 +2940,7 @@ struct InboxRow: View {
         case "SUCCESS": tag("CI ✓", .green)
         case "FAILURE", "ERROR": tag("CI ✗", .red)
         case "PENDING", "EXPECTED": tag("CI …", .orange)
+        case "ACTION_REQUIRED": tag("CI ✋", .orange)
         default: EmptyView()
         }
     }
@@ -3623,6 +3658,7 @@ struct NodeRow: View {
             case "SUCCESS": tag("CI ✓", .green)
             case "FAILURE", "ERROR": tag("CI ✗", .red)
             case "PENDING", "EXPECTED": tag("CI …", .orange)
+            case "ACTION_REQUIRED": tag("CI ✋", .orange)
             default: EmptyView()
             }
         }
