@@ -387,8 +387,11 @@ struct Project: Codable, Identifiable {
 struct Store: Codable {
     var projects: [Project] = []
     var selected: UUID?
+    /// 忽略过的 @：PR → 我忽略的是哪一次（存那次被点的时间）。
+    /// 一个 PR 只记一条，新的 @ 时间更晚，自然又会冒出来 —— 不用清理历史。
+    var dismissedPings: [String: Date] = [:]
 
-    enum CodingKeys: String, CodingKey { case projects, selected }
+    enum CodingKeys: String, CodingKey { case projects, selected, dismissedPings }
 
     init() {}
 
@@ -396,6 +399,7 @@ struct Store: Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         projects = try c.decodeIfPresent([Project].self, forKey: .projects) ?? []
         selected = try c.decodeIfPresent(UUID.self, forKey: .selected)
+        dismissedPings = try c.decodeIfPresent([String: Date].self, forKey: .dismissedPings) ?? [:]
     }
 
     /// 把项目挪到第 index 个位置（index 是「插到谁前面」，等于 count 表示放末尾）。
@@ -1137,8 +1141,9 @@ final class Model: ObservableObject {
         if store.selected == nil { store.selected = store.projects.first?.id }
         // 没走过导览就开一次。看板空不空都能走 —— 导览期间铺的是 TourDemo 的样板数据
         if !Prefs.tutorialDoneFlag { tourIndex = 0 }
+        // 先探测 gh，再干活 —— 两边都要账号。detectToolchain 内部会去重，
+        // 所以这两个 Task 只会真探测一次
         Task { await self.refresh() }
-        Task { await self.detectToolchain() }
         // 启动时也拉一次 reviewer 清单：标签上那个数字得一打开就是准的，
         // 否则「有人在等我」这件事要点进去才知道，等于白做
         Task { await self.refreshInbox() }
@@ -1163,10 +1168,31 @@ final class Model: ObservableObject {
         }
     }
 
+    /// 正在跑的那次探测。多处都要账号（看板的自动导入、reviewer 清单），
+    /// 各自触发一次纯属浪费，而且会撞出「还没探测完就说没登录」的假错。
+    private var detectTask: Task<Void, Never>?
+
     func detectToolchain() async {
-        detecting = true
-        gh = await Self.detectGh()
-        detecting = false
+        if let t = detectTask { await t.value; return }
+        let t = Task { @MainActor in
+            detecting = true
+            gh = await Self.detectGh()
+            detecting = false
+        }
+        detectTask = t
+        await t.value
+        detectTask = nil
+    }
+
+    /// 拿 gh 账号，必要时先等探测完。
+    ///
+    /// 启动时这几件事是并发跑的，账号还没探测出来就去查清单的话，
+    /// 会先闪一下「还没登录 gh」再自己好 —— 那不是错误，是还没问完。
+    func account() async -> String? {
+        if let a = gh.account, !a.isEmpty { return a }
+        await detectToolchain()
+        let a = gh.account
+        return (a?.isEmpty ?? true) ? nil : a
     }
 
     /// 用 Homebrew 装 gh。输出流式显示 —— brew 可能要跑几分钟，不能让人干等一个转圈。
@@ -1303,16 +1329,34 @@ final class Model: ObservableObject {
         return store.projects.map(\.repo).filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
+    /// 忽略这一次 @：这条从清单里去掉，下次有人再点我（时间更晚）还会重新出现
+    func dismissPing(_ item: ReviewItem) {
+        store.dismissedPings[item.id] = item.pingedAt ?? Date()
+        inbox.removeAll { $0.id == item.id }
+        save()
+    }
+
+    /// 滤掉已经忽略过的那些 @。纯函数，方便单测。
+    nonisolated static func applyDismissed(_ items: [ReviewItem],
+                                           dismissed: [String: Date]) -> [ReviewItem] {
+        items.filter { it in
+            guard it.kind == .mentioned, let cut = dismissed[it.id] else { return true }
+            guard let ping = it.pingedAt else { return false }
+            return ping > cut     // 忽略之后又被点了才重新冒出来
+        }
+    }
+
     func refreshInbox() async {
         guard !inboxLoading else { return }
-        guard let who = gh.account, !who.isEmpty else {
+        inboxLoading = true
+        defer { inboxLoading = false }
+        guard let who = await account() else {
             inboxError = "还没登录 gh，到设置里点「在终端登录」"
             return
         }
-        inboxLoading = true
-        defer { inboxLoading = false }
         do {
-            inbox = try await Self.fetchReviewInbox(repos: inboxRepos, account: who)
+            let got = try await Self.fetchReviewInbox(repos: inboxRepos, account: who)
+            inbox = Self.applyDismissed(got, dismissed: store.dismissedPings)
             inboxAt = Date()
             inboxError = nil
         } catch let e {
@@ -1415,7 +1459,7 @@ final class Model: ObservableObject {
 
         // 状态和「我的 PR」搜索挤在同一次请求里 —— 慢的是握手不是数据量，见 fetchAll
         let numbers = p.nodes.allPRNumbers
-        let who = Prefs.autoImportOn ? gh.account : nil
+        let who = Prefs.autoImportOn ? await account() : nil
         guard !numbers.isEmpty || !(who ?? "").isEmpty else {
             // 一个 PR 都没有、也不用自动导入：记成「拉过了」，免得每次切回来都白试一次
             liveByProject[pid] = [:]
@@ -1692,13 +1736,46 @@ final class Model: ObservableObject {
         }
 
         // 有写权限的仓库才去看「谁的 workflow 卡着等我批」
+        var approvals: [ReviewItem] = []
         await withTaskGroup(of: [ReviewItem].self) { group in
             for repo in writable {
                 group.addTask { await pendingApprovals(gh: gh, repo: repo, account: account) }
             }
-            for await items in group { raw += items }
+            for await items in group { approvals += items }
         }
+        raw += await dropSettled(approvals, gh: gh)
         return arrange(raw)
+    }
+
+    /// 扔掉那些 PR 已经合了 / 关了的批准项。
+    ///
+    /// 另外三档搜索里带 `is:open`，PR 一合上就自动不在了。但批准项是从 workflow run 来的：
+    /// **别人先把 PR 合掉之后，那个 run 还挂在 waiting 上**，不管它就会一直显示 ——
+    /// 而流程上早就走完了，没人被我卡着。
+    private nonisolated static func dropSettled(_ items: [ReviewItem], gh: String) async -> [ReviewItem] {
+        let withPR = items.filter { $0.number > 0 }
+        guard !withPR.isEmpty else { return items }   // 挂不到 PR 上的（fork 那种）没法查，留着
+
+        // 按仓库分组，一次 GraphQL 查完所有相关 PR 的状态
+        var body = ""
+        for (i, it) in withPR.enumerated() {
+            let parts = it.repo.split(separator: "/")
+            guard parts.count == 2 else { continue }
+            body += " p\(i): repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") "
+                + "{ pullRequest(number: \(it.number)) { state } }"
+        }
+        guard !body.isEmpty,
+              let out = try? await run(gh, ["api", "graphql", "-f", "query=query {\(body) }"]),
+              let obj = try? JSONSerialization.jsonObject(with: Data(out.stdout.utf8)) as? [String: Any],
+              let data = obj["data"] as? [String: Any]
+        else { return items }   // 查不到就别乱删
+
+        var settled = Set<String>()
+        for (i, it) in withPR.enumerated() {
+            let st = ((data["p\(i)"] as? [String: Any])?["pullRequest"] as? [String: Any])?["state"] as? String
+            if st == "MERGED" || st == "CLOSED" { settled.insert(it.id) }
+        }
+        return items.filter { !settled.contains($0.id) }
     }
 
     /// 卡在等人批准的 workflow run，且**我批得动**的那些。
@@ -2625,7 +2702,7 @@ struct InboxView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                if let e = m.inboxError {
+                if let e = m.inboxError, !m.inboxLoading {
                     Label(e, systemImage: "exclamationmark.triangle")
                         .foregroundColor(.red)
                         .padding(10)
@@ -2638,8 +2715,12 @@ struct InboxView: View {
                 section(.assigned, "指派给我", "别人建的 PR 把我设成了负责人")
                 section(.mentioned, "@ 到我", "有人在 PR 里点了我，等我回话")
 
-                if m.inbox.isEmpty && !m.inboxLoading && m.inboxError == nil {
-                    empty
+                if m.inbox.isEmpty {
+                    if m.inboxLoading {
+                        loading
+                    } else if m.inboxError == nil {
+                        empty
+                    }
                 }
             }
             .padding(14)
@@ -2663,6 +2744,15 @@ struct InboxView: View {
             ForEach(rows) { InboxRow(item: $0) }
             Spacer().frame(height: 14)
         }
+    }
+
+    /// 第一次拉要好几秒（一次请求就得 5 秒起），空着不动会让人以为坏了
+    var loading: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("正在看谁在等你…").foregroundColor(.secondary)
+        }
+        .padding(.top, 30)
     }
 
     /// 空清单不是「出错了」，得说清楚为什么空 —— 尤其是批 workflow 那一档，
@@ -2710,6 +2800,19 @@ struct InboxRow: View {
                     if item.kind == .approveCI { tag(item.kind.label, .orange) }
                     ciTag
                     reviewTag
+                    // 只有 @ 需要手动消：另两档 GitHub 自己会撤。
+                    // 有些 @ 就是知会一声，不需要我回话，那就忽略掉
+                    if item.kind == .mentioned {
+                        Button {
+                            m.dismissPing(item)
+                        } label: {
+                            Label("忽略", systemImage: "bell.slash")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("这次不用我处理。下次有人再 @ 我还会出现")
+                    }
                 }
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.branch").font(.system(size: 9))

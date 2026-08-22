@@ -810,6 +810,52 @@ struct Tests {
         check(Model.parseReviewItem(handled, repo: "o/a", kind: .requested, account: "me") != nil,
               "「请我 review」不受这条规则影响")
 
+        // --- 忽略这一次 @ ---
+        // 有些 @ 就是知会一声，不需要我回话，那就手动消掉；下次再被点还会出现
+        func ping(_ n: Int, at t: Double) -> ReviewItem {
+            var it = item(.mentioned, "o/a", n)
+            it = ReviewItem(kind: .mentioned, repo: "o/a", number: n, title: "t", url: "u",
+                            author: "other", base: "main", isDraft: false, review: nil, ci: nil,
+                            at: Date(timeIntervalSince1970: t), note: "",
+                            pingedAt: Date(timeIntervalSince1970: t))
+            return it
+        }
+        let p1 = ping(1, at: 1000)
+        check(Model.applyDismissed([p1], dismissed: [:]).count == 1, "没忽略过的照常显示")
+        check(Model.applyDismissed([p1], dismissed: ["o/a#1": Date(timeIntervalSince1970: 1000)]).isEmpty,
+              "忽略掉这一次就不显示了")
+        check(Model.applyDismissed([ping(1, at: 2000)],
+                                   dismissed: ["o/a#1": Date(timeIntervalSince1970: 1000)]).count == 1,
+              "忽略之后又被点一次 → 重新出现")
+        check(Model.applyDismissed([ping(1, at: 1000)],
+                                   dismissed: ["o/a#2": Date(timeIntervalSince1970: 1000)]).count == 1,
+              "忽略的是另一个 PR，不影响这个")
+        // 忽略只管 @ 这一档：另两档 GitHub 自己会撤，不该被手动记账挡住
+        check(Model.applyDismissed([item(.requested, "o/a", 1)],
+                                   dismissed: ["o/a#1": Date(timeIntervalSince1970: 9999)]).count == 1,
+              "「请我 review」不受忽略影响")
+        check(Model.applyDismissed([item(.approveCI, "o/a", 1)],
+                                   dismissed: ["o/a#1": Date(timeIntervalSince1970: 9999)]).count == 1,
+              "「等我批准」不受忽略影响")
+
+        // --- 忽略记录能存能读 ---
+        var st = Store()
+        st.dismissedPings = ["o/a#1": Date(timeIntervalSince1970: 1000)]
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .deferredToDate
+        let dec = JSONDecoder()
+        if let blob = try? enc.encode(st), let back = try? dec.decode(Store.self, from: blob) {
+            check(back.dismissedPings["o/a#1"] == Date(timeIntervalSince1970: 1000),
+                  "忽略记录能落盘、能读回来")
+        } else {
+            check(false, "Store 应该能编解码")
+        }
+        if let blob = #"{"projects":[]}"#.data(using: .utf8),
+           let back = try? dec.decode(Store.self, from: blob) {
+            check(back.dismissedPings.isEmpty, "老数据文件没这个字段也能读（回落成空）")
+        } else {
+            check(false, "缺字段的老文件应该能读")
+        }
+
         check(GhParse.date(from: "2026-08-20T06:14:00Z") != nil, "解析 ISO8601 时间戳")
         check(GhParse.date(from: "不是时间") == nil, "解析不了就返回 nil")
     }
