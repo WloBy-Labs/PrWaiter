@@ -24,6 +24,7 @@ struct Tests {
         importOrderTests()
         reparentTests()
         projectReorderTests()
+        inboxTests()
         checkRollupTests()
         statusTests()
         migrationTests()
@@ -622,6 +623,260 @@ struct Tests {
 
         // 拉不到标题时不猜
         check(Tree.reparenting([trunk], titles: [:]) == nil, "没有标题就不动")
+    }
+
+    static func inboxTests() {
+        print("reviewer 视角:")
+
+        func item(_ kind: ReviewItem.Kind, _ repo: String, _ n: Int, at: Double = 0) -> ReviewItem {
+            ReviewItem(kind: kind, repo: repo, number: n, title: "t", url: "u", author: "other",
+                       base: "main", isDraft: false, review: nil, ci: nil,
+                       at: Date(timeIntervalSince1970: at), note: "")
+        }
+
+        // --- 分档：等我批准 > 请我 review > 指派给我 > @ 到我 ---
+        // 排序就是「谁被卡得最死」：workflow 不批，对方的 CI 一步都走不了
+        let mixed = [item(.mentioned, "o/a", 1), item(.assigned, "o/a", 2),
+                     item(.requested, "o/a", 3), item(.approveCI, "o/a", 4)]
+        check(Model.arrange(mixed).map(\.number) == [4, 3, 2, 1], "按「卡得多死」排序")
+
+        // --- 同一个 PR 命中多个搜索：只留最该办的那一档 ---
+        let dup = Model.arrange([item(.mentioned, "o/a", 5), item(.requested, "o/a", 5),
+                                 item(.assigned, "o/a", 5)])
+        check(dup.count == 1, "一件事只出现一次")
+        check(dup[0].kind == .requested, "留最该办的那一档")
+        check(Model.arrange([item(.requested, "o/a", 5), item(.mentioned, "o/a", 5)])[0].kind
+              == .requested, "跟先后顺序无关")
+
+        // 不同仓库的同号 PR 是两件事
+        check(Model.arrange([item(.requested, "o/a", 5), item(.requested, "o/b", 5)]).count == 2,
+              "不同仓库的同号 PR 不能被去重掉")
+
+        // 拿不到 PR 编号的 workflow run（fork 的常这样）靠 url 区分，不能互相盖掉
+        let r1 = ReviewItem(kind: .approveCI, repo: "o/a", number: 0, title: "t", url: "run/1",
+                            author: "x", base: "b", isDraft: false, review: nil, ci: nil,
+                            at: nil, note: "")
+        let r2 = ReviewItem(kind: .approveCI, repo: "o/a", number: 0, title: "t", url: "run/2",
+                            author: "x", base: "b", isDraft: false, review: nil, ci: nil,
+                            at: nil, note: "")
+        check(Model.arrange([r1, r2]).count == 2, "没有 PR 编号的 run 按 url 区分")
+
+        // --- 同档之内按时间，等得久的不该被新来的埋掉：新的在上，一眼看到最新请求 ---
+        let byTime = Model.arrange([item(.requested, "o/a", 1, at: 100),
+                                    item(.requested, "o/a", 2, at: 300),
+                                    item(.requested, "o/a", 3, at: 200)])
+        check(byTime.map(\.number) == [2, 3, 1], "同档按时间倒序，刚请我的排最上面")
+
+        // --- 解析：「别人从什么时候开始等我」要从 timeline 取 ---
+        // 三天前请我 review、刚被作者推了一版，不该排到「十分钟前请我」前面
+        let base: [String: Any] = [
+            "number": 42, "title": "别人的 PR", "url": "u", "isDraft": false,
+            "updatedAt": "2026-08-22T02:00:00Z", "baseRefName": "main",
+            "author": ["login": "someone"], "repository": ["nameWithOwner": "o/a"],
+            "commits": ["nodes": [["commit": [
+                "statusCheckRollup": ["contexts": ["nodes": [
+                    ["__typename": "CheckRun", "name": "build", "status": "COMPLETED",
+                     "conclusion": "SUCCESS"],
+                ]]],
+                "checkSuites": ["nodes": [["status": "COMPLETED"]]],
+            ]]]],
+        ]
+        var withReq = base
+        withReq["timelineItems"] = ["nodes": [
+            ["createdAt": "2026-08-19T00:00:00Z", "requestedReviewer": ["login": "someone-else"]],
+            ["createdAt": "2026-08-20T06:14:00Z", "requestedReviewer": ["login": "me"]],
+        ]]
+        let a1 = Model.parseReviewItem(withReq, repo: "o/a", kind: .requested, account: "me")
+        check(a1?.at == GhParse.date(from: "2026-08-20T06:14:00Z"), "取的是请我那次的时间")
+        check(a1?.ci == "SUCCESS", "CI 结论复用同一套算法")
+        check(a1?.author == "someone", "显示的是 PR 作者，也就是在等我的那个人")
+
+        var otherOnly = base
+        otherOnly["timelineItems"] = ["nodes": [
+            ["createdAt": "2026-08-19T00:00:00Z", "requestedReviewer": ["login": "someone-else"]],
+        ]]
+        check(Model.parseReviewItem(otherOnly, repo: "o/a", kind: .requested, account: "me")?.at
+              == GhParse.date(from: "2026-08-22T02:00:00Z"), "只请了别人时退回 PR 更新时间")
+
+        var team = base
+        team["timelineItems"] = ["nodes": [
+            ["createdAt": "2026-08-21T00:00:00Z", "requestedReviewer": ["name": "storage-team"]],
+        ]]
+        check(Model.parseReviewItem(team, repo: "o/a", kind: .requested, account: "me")?.at
+              == GhParse.date(from: "2026-08-21T00:00:00Z"), "按团队请我 review 也算数")
+
+        // 指派给我也算「开始等我」的时刻
+        var asg = base
+        asg["timelineItems"] = ["nodes": [
+            ["createdAt": "2026-08-21T10:00:00Z", "assignee": ["login": "me"]],
+        ]]
+        check(Model.parseReviewItem(asg, repo: "o/a", kind: .assigned, account: "me")?.at
+              == GhParse.date(from: "2026-08-21T10:00:00Z"), "被指派的时间也认")
+
+        // --- 仓库改名：显示响应里的真名 ---
+        // 实测配置里的 maka-agent/maka-agent 已经转移成 apache/maka，
+        // 用旧名照样能查（GitHub 重定向），但显示旧名会让人对不上号
+        var renamed = base
+        renamed["repository"] = ["nameWithOwner": "apache/maka"]
+        let rn = Model.parseReviewItem(renamed, repo: "maka-agent/maka-agent",
+                                       kind: .requested, account: "me")
+        check(rn?.repo == "apache/maka", "改名后的仓库显示新名字")
+        check(rn?.id == "apache/maka#42", "去重的键也跟着用新名字")
+        var noRepo = base
+        noRepo["repository"] = [:] as [String: Any]
+        check(Model.parseReviewItem(noRepo, repo: "o/a", kind: .requested, account: "me")?.repo
+              == "o/a", "响应里没带仓库名时退回查询时填的那个")
+
+        // --- 「@ 到我」什么时候算消掉 ---
+        // 规则：有人在我最后一次发言之后又点了我，才算还欠着。
+        // 不必回复那条 @ 本身 —— 提交 review（含批准）、新加评论、回复他，都算我接手了。
+        func talk(comments: [[String: Any]] = [], reviews: [[String: Any]] = [],
+                  threads: [[String: Any]] = [], body: String = "", created: String = "2026-08-01T00:00:00Z",
+                  updated: String = "2026-08-22T02:00:00Z") -> [String: Any] {
+            ["bodyText": body, "createdAt": created, "updatedAt": updated,
+             "author": ["login": "someone"],
+             "comments": ["nodes": comments], "reviews": ["nodes": reviews],
+             "reviewThreads": ["nodes": threads]]
+        }
+        func said(_ who: String, _ t: String, _ text: String) -> [String: Any] {
+            ["author": ["login": who], "createdAt": t, "bodyText": text]
+        }
+        func reviewed(_ who: String, _ t: String, _ text: String = "") -> [String: Any] {
+            ["author": ["login": who], "submittedAt": t, "bodyText": text]
+        }
+
+        // 别人点了我，我还没说过话 → 显示，时间是被点的那一刻
+        let pinged = talk(comments: [said("other", "2026-08-21T09:00:00Z", "这块 @me 看下")])
+        check(Model.pingTime(pinged, account: "me") == GhParse.date(from: "2026-08-21T09:00:00Z"),
+              "别人点了我、我没回 → 还欠着，时间是被点那一刻")
+
+        // 我之后加了条评论 → 消掉（不用回那条）
+        let replied = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@me 看下"),
+                                      said("me", "2026-08-21T10:00:00Z", "在别处说了句别的")])
+        check(Model.pingTime(replied, account: "me") == nil, "我之后随便说句话就算接手，不必回那条")
+
+        // 我之后提交了 review（批准也算「我动了」）
+        let approved = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@me 看下")],
+                            reviews: [reviewed("me", "2026-08-21T11:00:00Z")])
+        check(Model.pingTime(approved, account: "me") == nil, "提交 review（含批准）也算接手")
+
+        // 我说完之后又被点一次 → 重新冒出来，时间换成新那次
+        let again = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@me 看下"),
+                                    said("me", "2026-08-21T10:00:00Z", "回了"),
+                                    said("other", "2026-08-21T12:00:00Z", "@me 还有个问题")])
+        check(Model.pingTime(again, account: "me") == GhParse.date(from: "2026-08-21T12:00:00Z"),
+              "我回完之后又被点 → 带新时间戳重新冒出来")
+
+        // 行内评论（review thread）里点我也算 —— 大仓库里 @ 人多半发生在具体代码行上
+        let inThread = talk(threads: [["comments": ["nodes": [said("other", "2026-08-21T08:00:00Z", "@me 这行")]]]])
+        check(Model.pingTime(inThread, account: "me") == GhParse.date(from: "2026-08-21T08:00:00Z"),
+              "行内评论里点我也算")
+
+        // PR 正文里点我，时间算开 PR 那一刻
+        let inBody = talk(body: "cc @me 帮忙看下", created: "2026-08-20T00:00:00Z")
+        check(Model.pingTime(inBody, account: "me") == GhParse.date(from: "2026-08-20T00:00:00Z"),
+              "PR 正文里点我也算，时间是开 PR 的时间")
+
+        // 我自己点自己不算
+        let selfPing = talk(comments: [said("me", "2026-08-21T09:00:00Z", "@me 提醒自己")])
+        check(Model.pingTime(selfPing, account: "me") == nil, "我自己写的 @我 不算别人在等我")
+
+        // 大小写不敏感 —— GitHub 的用户名不区分大小写
+        let cased = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@ME 看下")])
+        check(Model.pingTime(cased, account: "me") != nil, "@ 的大小写不影响判断")
+
+        // 扫不到「@我」的字样（按团队 @ 的、或在没拉到的那些评论里）：
+        // 用 PR 更新时间兜底，宁可显示出来让人自己判断，也别悄悄吞掉
+        let teamPing = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@storage-team 看下")])
+        check(Model.pingTime(teamPing, account: "me") == GhParse.date(from: "2026-08-22T02:00:00Z"),
+              "扫不到明确的 @我 时不吞掉，用更新时间兜底")
+        // 但我最后说话比这还新，就当处理过了
+        let teamThenMe = talk(comments: [said("other", "2026-08-21T09:00:00Z", "@storage-team"),
+                                         said("me", "2026-08-22T03:00:00Z", "回了")],
+                              updated: "2026-08-22T02:00:00Z")
+        check(Model.pingTime(teamThenMe, account: "me") == nil, "兜底情况下我说过话也算接手")
+
+        // 接到解析上：已处理的那条根本不进清单
+        var handled = base
+        for (k, v) in replied { handled[k] = v }
+        check(Model.parseReviewItem(handled, repo: "o/a", kind: .mentioned, account: "me") == nil,
+              "已经回过话的 @ 不进清单")
+        var pendingPing = base
+        for (k, v) in pinged { pendingPing[k] = v }
+        let pi = Model.parseReviewItem(pendingPing, repo: "o/a", kind: .mentioned, account: "me")
+        check(pi != nil, "没回过话的 @ 要进清单")
+        check(pi?.at == GhParse.date(from: "2026-08-21T09:00:00Z"), "排序用的是被点那一刻")
+        // 另外两档不看这个规则：请我 review / 指派给我 有各自的消除方式（GitHub 自己会撤）
+        check(Model.parseReviewItem(handled, repo: "o/a", kind: .requested, account: "me") != nil,
+              "「请我 review」不受这条规则影响")
+
+        // --- 忽略这一次 @ ---
+        // 有些 @ 就是知会一声，不需要我回话，那就手动消掉；下次再被点还会出现
+        func ping(_ n: Int, at t: Double) -> ReviewItem {
+            var it = item(.mentioned, "o/a", n)
+            it = ReviewItem(kind: .mentioned, repo: "o/a", number: n, title: "t", url: "u",
+                            author: "other", base: "main", isDraft: false, review: nil, ci: nil,
+                            at: Date(timeIntervalSince1970: t), note: "",
+                            pingedAt: Date(timeIntervalSince1970: t))
+            return it
+        }
+        let p1 = ping(1, at: 1000)
+        check(Model.applyDismissed([p1], dismissed: [:]).count == 1, "没忽略过的照常显示")
+        check(Model.applyDismissed([p1], dismissed: ["o/a#1": Date(timeIntervalSince1970: 1000)]).isEmpty,
+              "忽略掉这一次就不显示了")
+        check(Model.applyDismissed([ping(1, at: 2000)],
+                                   dismissed: ["o/a#1": Date(timeIntervalSince1970: 1000)]).count == 1,
+              "忽略之后又被点一次 → 重新出现")
+        check(Model.applyDismissed([ping(1, at: 1000)],
+                                   dismissed: ["o/a#2": Date(timeIntervalSince1970: 1000)]).count == 1,
+              "忽略的是另一个 PR，不影响这个")
+        // 忽略只管 @ 这一档：另两档 GitHub 自己会撤，不该被手动记账挡住
+        check(Model.applyDismissed([item(.requested, "o/a", 1)],
+                                   dismissed: ["o/a#1": Date(timeIntervalSince1970: 9999)]).count == 1,
+              "「请我 review」不受忽略影响")
+        check(Model.applyDismissed([item(.approveCI, "o/a", 1)],
+                                   dismissed: ["o/a#1": Date(timeIntervalSince1970: 9999)]).count == 1,
+              "「等我批准」不受忽略影响")
+
+        // --- 忽略记录能存能读 ---
+        var st = Store()
+        st.dismissedPings = ["o/a#1": Date(timeIntervalSince1970: 1000)]
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .deferredToDate
+        let dec = JSONDecoder()
+        if let blob = try? enc.encode(st), let back = try? dec.decode(Store.self, from: blob) {
+            check(back.dismissedPings["o/a#1"] == Date(timeIntervalSince1970: 1000),
+                  "忽略记录能落盘、能读回来")
+        } else {
+            check(false, "Store 应该能编解码")
+        }
+        if let blob = #"{"projects":[]}"#.data(using: .utf8),
+           let back = try? dec.decode(Store.self, from: blob) {
+            check(back.dismissedPings.isEmpty, "老数据文件没这个字段也能读（回落成空）")
+        } else {
+            check(false, "缺字段的老文件应该能读")
+        }
+
+        // --- 两个视角是两套东西：看板已经在跟的，评审清单里不再出现 ---
+        // 主要挡的是机器人代建的 backport：作者是 bot、把我设成 assignee，
+        // 看板按 assignee 把它导进来当我的贡献，评审清单按 assignee:@me 也会搜到它
+        func tracked(_ kind: ReviewItem.Kind, repo: String, queried: String, _ n: Int) -> ReviewItem {
+            ReviewItem(kind: kind, repo: repo, number: n, title: "t", url: "u", author: "bot",
+                       base: "main", isDraft: false, review: nil, ci: nil, at: nil,
+                       note: "", queried: queried)
+        }
+        let onBoard = tracked(.assigned, repo: "o/a", queried: "o/a", 7)
+        check(Model.excludeTracked([onBoard], tracked: ["o/a#7"]).isEmpty, "看板在跟的不进评审清单")
+        check(Model.excludeTracked([onBoard], tracked: ["o/a#8"]).count == 1, "别的编号不受影响")
+        check(Model.excludeTracked([onBoard], tracked: []).count == 1, "看板没跟的照常显示")
+        // 仓库改过名：看板存的是旧名，GitHub 返回新名 —— 得按查询时的名字对账
+        let renamedItem = tracked(.assigned, repo: "apache/maka", queried: "maka-agent/maka-agent", 7)
+        check(Model.excludeTracked([renamedItem], tracked: ["maka-agent/maka-agent#7"]).isEmpty,
+              "仓库改过名时按配置里的旧名对账，不会漏掉")
+        check(Model.excludeTracked([renamedItem], tracked: ["apache/maka#7"]).isEmpty,
+              "按新名也认")
+
+        check(GhParse.date(from: "2026-08-20T06:14:00Z") != nil, "解析 ISO8601 时间戳")
+        check(GhParse.date(from: "不是时间") == nil, "解析不了就返回 nil")
     }
 
     static func checkRollupTests() {
