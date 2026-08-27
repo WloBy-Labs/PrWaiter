@@ -51,6 +51,18 @@ brew install gh && gh auth login
 ./build.sh && open PrWaiter.app     # 开发时这样就够
 ```
 
+`build.sh` 会读 `bootstrap_local_signing.sh` 写的 `signing.env` 并用那个稳定身份签包
+（跟 `package_app.sh` 同一条路），签不上就退回 ad-hoc 并提示。
+
+**要调通知功能必须有稳定签名身份** —— macOS 不给 ad-hoc 签名的 app 发通知权限：
+`requestAuthorization` 直接返回 `granted=false`（`UNErrorDomain error 1`），而且这个 app
+连「系统设置 → 通知」列表都不会出现，看起来就像功能没做。跑一次
+`scripts/bootstrap_local_signing.sh` 就有了。
+
+> 注意：某些非交互 / 远程 shell 里拿不到钥匙串的签名权限，
+> `security find-identity -v -p codesigning` 会返回 0 个身份，这时只能签成 ad-hoc。
+> 在自己的图形会话里跑 `./build.sh` 才会看到「已用 PrWaiter Local Signing 签名」。
+
 要出和 Release 一样的产物：
 
 ```bash

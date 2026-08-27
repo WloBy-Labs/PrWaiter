@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 import AppKit
 
 // MARK: - 数据模型
@@ -466,12 +467,13 @@ enum Prefs {
     static let autoCheckUpdate = "autoCheckUpdate"  // 启动时检查更新
     static let autoInstallUpdate = "autoInstallUpdate"  // 查到就自动装（默认关）
     static let tutorialDone = "tutorialDone"        // 首次引导走完没
+    static let notify = "notify"                    // PR 状态变了发通知
 
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
             refreshInterval: 60, autoImport: true,
             autoCheckUpdate: true, autoInstallUpdate: false,
-            tutorialDone: false,
+            tutorialDone: false, notify: true,
         ])
     }
 
@@ -479,6 +481,7 @@ enum Prefs {
     static var autoCheckUpdateOn: Bool { UserDefaults.standard.bool(forKey: autoCheckUpdate) }
     static var autoInstallUpdateOn: Bool { UserDefaults.standard.bool(forKey: autoInstallUpdate) }
     static var tutorialDoneFlag: Bool { UserDefaults.standard.bool(forKey: tutorialDone) }
+    static var notifyOn: Bool { UserDefaults.standard.bool(forKey: notify) }
 
     static var customGhPath: String {
         UserDefaults.standard.string(forKey: ghPath) ?? ""
@@ -859,6 +862,104 @@ enum PRStatus: CaseIterable {
     var isSettled: Bool { self == .merged || self == .closed }
 }
 
+/// 发系统通知。
+///
+/// 只在 app 装在正经位置（比如 /Applications）时才真的能发 —— 实测从 /private/tmp
+/// 里启动的同一个包，requestAuthorization 直接返回「Notifications are not allowed
+/// for this application」。所以拿不到授权时不报错，静默算了，别拿弹窗烦人。
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = Notifier()
+
+    private var asked = false
+
+    func start() {
+        UNUserNotificationCenter.current().delegate = self
+        request()
+    }
+
+    func request() {
+        guard !asked else { return }
+        asked = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// url 非空时，点通知会打开那个 PR
+    func post(title: String, body: String, url: String = "") {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        if !url.isEmpty { c.userInfo = ["url": url] }
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+
+    /// app 在前台时也把横幅显出来 —— 否则你正看着别的窗口就完全收不到
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent n: UNNotification,
+                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner, .sound])
+    }
+
+    /// 点通知直接跳到那个 PR
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive r: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        if let s = r.notification.request.content.userInfo["url"] as? String,
+           let u = URL(string: s) {
+            NSWorkspace.shared.open(u)
+        }
+        done()
+    }
+}
+
+/// 一次状态变化。自动刷新发现了才通知 —— 你自己点刷新看到的不用再弹一遍。
+struct StatusChange {
+    let repo: String
+    let number: Int
+    let title: String
+    let url: String
+    let from: PRStatus
+    let to: PRStatus
+
+    /// 「等 review → 可合并」
+    var line: String { "\(from.label) → \(to.label)" }
+}
+
+enum Watcher {
+    /// 比对两次刷新之间的状态。纯函数，方便单测。
+    ///
+    /// 几种情况不报：
+    /// - **第一次拉**（没有上一份快照）—— 那不是「变化」，是刚知道。不然一启动就炸一屏
+    /// - **任何一头是「未知」** —— 拉取失败或刚导进来还没状态，报了也是噪音
+    /// - 状态没变的
+    static func changes(from old: [Int: PRStatus], to new: [Int: PRStatus],
+                        info: (Int) -> (repo: String, title: String, url: String)?) -> [StatusChange]
+    {
+        guard !old.isEmpty else { return [] }
+        return new.compactMap { n, to -> StatusChange? in
+            guard let from = old[n], from != to else { return nil }
+            guard from != .unknown, to != .unknown else { return nil }
+            guard let i = info(n) else { return nil }
+            return StatusChange(repo: i.repo, number: n, title: i.title, url: i.url,
+                                from: from, to: to)
+        }
+        // 编号大的排前面：新 PR 通常更要紧
+        .sorted { $0.number > $1.number }
+    }
+
+    /// 通知文案。一条就说清楚是哪个 PR、怎么变的；多条就汇总，别刷屏。
+    static func message(_ cs: [StatusChange]) -> (title: String, body: String)? {
+        guard let first = cs.first else { return nil }
+        let repo = first.repo.split(separator: "/").last.map(String.init) ?? first.repo
+        if cs.count == 1 {
+            return ("\(repo) #\(first.number)  \(first.line)", first.title)
+        }
+        return ("\(cs.count) 个 PR 状态变了",
+                cs.prefix(4).map { "#\($0.number) \($0.to.label)" }.joined(separator: "、")
+                    + (cs.count > 4 ? " 等" : ""))
+    }
+}
+
 // MARK: - 上手导览（聚光灯式）
 
 /// 要高亮的界面元素。用 preference 上报各自的位置，遮罩再据此挖洞。
@@ -1136,6 +1237,13 @@ final class Model: ObservableObject {
     @Published var loading = false
     /// 正在拉的项目。所有项目并发刷新时，单个 Bool 挡不住重入
     private var inFlight = Set<UUID>()
+
+    /// 上一轮每个 PR 是什么状态，用来比对出变化。
+    /// **只放内存**：重启之后第一次拉当基线，不补报关机期间的变化 ——
+    /// 一开机炸一屏通知比不通知更烦。
+    private var lastStatus: [UUID: [Int: PRStatus]] = [:]
+    /// 上一轮评审清单里有哪些事，用来认出「新来的」
+    private var lastInboxIDs: Set<String> = []
     @Published var editing = false
     @Published var gh = GhStatus()
     @Published var detecting = false
@@ -1183,6 +1291,7 @@ final class Model: ObservableObject {
         if !Prefs.tutorialDoneFlag { tourIndex = 0 }
         // 先探测 gh，再干活 —— 两边都要账号。detectToolchain 内部会去重，
         // 所以这两个 Task 只会真探测一次
+        if Prefs.notifyOn { Notifier.shared.start() }
         // 一上来就把所有项目和评审清单都拉一遍：切换按钮上那个待办数
         // 得一打开就是准的，否则「有人在等我」这件事要点进去才知道，等于白做
         Task { await self.refreshEverything() }
@@ -1199,7 +1308,7 @@ final class Model: ObservableObject {
         let seconds = Prefs.interval
         guard seconds > 0 else { return }
         timer = Timer.scheduledTimer(withTimeInterval: Double(seconds), repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.refreshEverything() }
+            Task { @MainActor in await self?.refreshEverything(auto: true) }
         }
     }
 
@@ -1390,6 +1499,27 @@ final class Model: ObservableObject {
         }
     }
 
+    /// 评审清单里新冒出来的事，通知一条。
+    /// 「有人开始等我」正是最该被叫醒的时刻 —— 这功能本来就是为了别让人卡在我这里。
+    func noticeInbox(auto: Bool) {
+        let ids = Set(inbox.map(\.id))
+        defer { lastInboxIDs = ids }
+        guard auto, Prefs.notifyOn, !lastInboxIDs.isEmpty else { return }
+
+        let fresh = inbox.filter { !lastInboxIDs.contains($0.id) }
+        guard let first = fresh.first else { return }
+        let repo = first.repo.split(separator: "/").last.map(String.init) ?? first.repo
+        if fresh.count == 1 {
+            Notifier.shared.post(title: "\(first.kind.label)：\(repo) #\(first.number)",
+                                 body: first.title, url: first.url)
+        } else {
+            Notifier.shared.post(title: "\(fresh.count) 件事在等你",
+                                 body: fresh.prefix(4)
+                                    .map { "\($0.kind.label) #\($0.number)" }
+                                    .joined(separator: "、"))
+        }
+    }
+
     /// 忽略这一次 @：这条从清单里去掉，下次有人再点我（时间更晚）还会重新出现
     func dismissPing(_ item: ReviewItem) {
         store.dismissedPings[item.id] = item.pingedAt ?? Date()
@@ -1407,7 +1537,7 @@ final class Model: ObservableObject {
         }
     }
 
-    func refreshInbox() async {
+    func refreshInbox(auto: Bool = false) async {
         guard !inboxLoading else { return }
         inboxLoading = true
         defer { inboxLoading = false }
@@ -1421,6 +1551,7 @@ final class Model: ObservableObject {
                                         dismissed: store.dismissedPings)
             inboxAt = Date()
             inboxError = nil
+            noticeInbox(auto: auto)
         } catch let e {
             inboxError = e.localizedDescription
         }
@@ -1514,11 +1645,11 @@ final class Model: ObservableObject {
     /// 为什么不只刷当前那个：切到别的项目、或者切到评审视角时总得再等一次，
     /// 而且切换按钮上的待办数会一直是旧的 —— 那个数字要有用，就得一直是准的。
     /// 各项目并发拉（每个项目一次请求，慢在握手，并发起来总耗时约等于最慢的那一个）。
-    func refreshEverything() async {
+    func refreshEverything(auto: Bool = false) async {
         let pids = store.projects.map(\.id)
         await withTaskGroup(of: Void.self) { group in
-            for pid in pids { group.addTask { @MainActor in await self.refresh(pid) } }
-            group.addTask { @MainActor in await self.refreshInbox() }
+            for pid in pids { group.addTask { @MainActor in await self.refresh(pid, auto: auto) } }
+            group.addTask { @MainActor in await self.refreshInbox(auto: auto) }
         }
     }
 
@@ -1527,7 +1658,9 @@ final class Model: ObservableObject {
 
     func refresh() async { await refresh(store.selected) }
 
-    func refresh(_ target: UUID?) async {
+    /// auto=true 表示是定时器自动拉的。手动点刷新时不通知 ——
+    /// 你正盯着屏幕，变化就在眼前，再弹一条纯属多余。
+    func refresh(_ target: UUID?, auto: Bool = false) async {
         guard let p = store.projects.first(where: { $0.id == target }), !p.repo.isEmpty else {
             if let pid = target { liveByProject[pid] = [:]; errorByProject[pid] = nil }
             return
@@ -1555,6 +1688,7 @@ final class Model: ObservableObject {
             liveByProject[pid] = r.live
             fetchedAt[pid] = Date()
             errorByProject[pid] = nil
+            noticeChanges(in: pid, live: r.live, auto: auto)
             fixBackportParents(in: pid, titles: r.live.mapValues(\.title))
             // 导入放在后面：搜索结果跟状态是同一次请求带回来的，不用再跑一趟。
             // 新导进来的这一批要等下一拍才有状态 —— 换一次往返（5 秒）不值。
@@ -1562,6 +1696,35 @@ final class Model: ObservableObject {
         } catch let e {
             errorByProject[pid] = e.localizedDescription
         }
+    }
+
+    /// 算出这个项目每个 PR 现在是什么状态。
+    /// 状态跟树有关（被上游挡着算 blocked），所以不能只看 live。
+    func statuses(of p: Project, live: [Int: LivePR]) -> [Int: PRStatus] {
+        var out: [Int: PRStatus] = [:]
+        for row in Tree.flatten(p.nodes, isMerged: { live[$0]?.state == "MERGED" })
+        where row.node.kind == .pr {
+            if let n = row.node.pr { out[n] = Self.classify(live[n], blocked: row.blocked) }
+        }
+        return out
+    }
+
+    /// 比对上一轮，把状态变化通知出去。
+    ///
+    /// 第一次拉只记基线不通知 —— 那不是「变了」，是刚知道。
+    func noticeChanges(in pid: UUID, live: [Int: LivePR], auto: Bool) {
+        guard let p = store.projects.first(where: { $0.id == pid }) else { return }
+        let now = statuses(of: p, live: live)
+        defer { lastStatus[pid] = now }
+
+        guard auto, Prefs.notifyOn, let old = lastStatus[pid] else { return }
+        let cs = Watcher.changes(from: old, to: now) { n in
+            guard let lv = live[n] else { return nil }
+            return (p.repo, lv.title, lv.url)
+        }
+        guard let m = Watcher.message(cs) else { return }
+        Notifier.shared.post(title: m.title, body: m.body,
+                             url: cs.count == 1 ? cs[0].url : "")
     }
 
     /// 一次性把多重 backport 的父节点摆正。要标题才能判断，所以放在拉完状态之后。
@@ -2973,6 +3136,7 @@ struct SettingsView: View {
     @EnvironmentObject var m: Model
     @AppStorage(Prefs.ghPath) private var customPath = ""
     @AppStorage(Prefs.refreshInterval) private var interval = 60
+    @AppStorage(Prefs.notify) private var notify = true
     @AppStorage(Prefs.autoImport) private var autoImport = true
     @AppStorage(Prefs.autoCheckUpdate) private var autoCheckUpdate = true
     @AppStorage(Prefs.autoInstallUpdate) private var autoInstallUpdate = false
@@ -3148,6 +3312,31 @@ struct SettingsView: View {
             .pickerStyle(.segmented)
             .onChange(of: interval) { _, _ in m.rescheduleTimer() }
             Toggle("自动导入我的 open PR", isOn: $autoImport)
+
+            Toggle("状态变了发通知", isOn: $notify)
+                .onChange(of: notify) { _, on in if on { Notifier.shared.start() } }
+            if notify {
+                LabeledContent("通知") {
+                    HStack(spacing: 8) {
+                        Button("发一条试试") {
+                            Notifier.shared.request()
+                            Notifier.shared.post(title: "PrWaiter",
+                                                 body: "通知能收到。真的状态变化长这样：#77400 等 review → 可合并")
+                        }
+                        Button("系统通知设置") {
+                            if let u = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") {
+                                NSWorkspace.shared.open(u)
+                            }
+                        }
+                        .buttonStyle(.link)
+                    }
+                }
+                // 用 .init 显式转成 LocalizedStringKey，否则字符串拼接出来的是 String，
+                // SwiftUI 不会当 markdown 解析，界面上会露出 ** 星号
+                Text(.init("只有**自动刷新**发现的变化才通知 —— 你自己点刷新时变化就在眼前，不用再弹一遍。"
+                     + "刚启动的第一次拉取算基线，不会补报关机期间的变化。"))
+                    .font(.caption).foregroundColor(.secondary)
+            }
         } header: {
             Text("刷新")
         } footer: {

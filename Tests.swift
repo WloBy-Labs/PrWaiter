@@ -24,6 +24,7 @@ struct Tests {
         importOrderTests()
         reparentTests()
         projectReorderTests()
+        watcherTests()
         inboxTests()
         checkRollupTests()
         statusTests()
@@ -623,6 +624,62 @@ struct Tests {
 
         // 拉不到标题时不猜
         check(Tree.reparenting([trunk], titles: [:]) == nil, "没有标题就不动")
+    }
+
+    static func watcherTests() {
+        print("状态变化通知:")
+
+        func info(_ n: Int) -> (repo: String, title: String, url: String)? {
+            ("o/a", "标题 \(n)", "https://x/\(n)")
+        }
+
+        // --- 第一次拉不报：那不是「变了」，是刚知道 ---
+        // 不这么做的话，一启动就会炸一屏通知
+        check(Watcher.changes(from: [:], to: [1: .ready, 2: .ciFailed], info: info).isEmpty,
+              "没有上一份快照时不报")
+
+        // --- 正常的一次变化 ---
+        let cs = Watcher.changes(from: [1: .needsReview], to: [1: .ready], info: info)
+        check(cs.count == 1, "认出一条变化")
+        check(cs[0].from == .needsReview && cs[0].to == .ready, "记住了从什么变成什么")
+        check(cs[0].line == "等 review → 可合并", "文案是人话")
+
+        // --- 没变的不报 ---
+        check(Watcher.changes(from: [1: .ready], to: [1: .ready], info: info).isEmpty, "没变就不报")
+
+        // --- 任何一头是「未知」都不报 ---
+        // 拉取失败会把状态打成 unknown，一来一回就是两条假通知
+        check(Watcher.changes(from: [1: .unknown], to: [1: .ready], info: info).isEmpty,
+              "从未知变过来不报（多半是上一轮拉取失败）")
+        check(Watcher.changes(from: [1: .ready], to: [1: .unknown], info: info).isEmpty,
+              "变成未知也不报（这一轮拉取失败）")
+
+        // --- 新导进来的 PR 不报：它在 old 里根本没有 ---
+        check(Watcher.changes(from: [1: .ready], to: [1: .ready, 2: .needsReview], info: info).isEmpty,
+              "这一轮新出现的 PR 不算状态变化")
+
+        // --- 查不到详情的跳过，别发一条没头没尾的 ---
+        check(Watcher.changes(from: [1: .needsReview], to: [1: .ready], info: { _ in nil }).isEmpty,
+              "拿不到标题/链接时不发")
+
+        // --- 多条时编号大的排前面 ---
+        let many = Watcher.changes(from: [1: .needsReview, 5: .needsReview, 3: .needsReview],
+                                   to: [1: .ready, 5: .ciFailed, 3: .merged], info: info)
+        check(many.map(\.number) == [5, 3, 1], "编号大的排前面，新 PR 通常更要紧")
+
+        // --- 通知文案 ---
+        check(Watcher.message([]) == nil, "没有变化就不发通知")
+        let one = Watcher.message(cs)
+        check(one?.title == "a #1  等 review → 可合并", "一条时标题说清楚是哪个 PR、怎么变的")
+        check(one?.body == "标题 1", "正文是 PR 标题")
+        let batch = Watcher.message(many)
+        check(batch?.title == "3 个 PR 状态变了", "多条时汇总，不刷屏")
+        check(batch?.body == "#5 CI 失败、#3 已合并、#1 可合并", "正文列出各自的新状态")
+        // 超过 4 条只列前 4 个
+        let lots = Watcher.changes(
+            from: Dictionary(uniqueKeysWithValues: (1...6).map { ($0, PRStatus.needsReview) }),
+            to: Dictionary(uniqueKeysWithValues: (1...6).map { ($0, PRStatus.ready) }), info: info)
+        check(Watcher.message(lots)?.body.hasSuffix(" 等") == true, "超过 4 条时截断，末尾带「等」")
     }
 
     static func inboxTests() {
