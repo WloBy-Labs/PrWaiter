@@ -3331,8 +3331,10 @@ struct SettingsView: View {
                         .buttonStyle(.link)
                     }
                 }
-                Text("只有**自动刷新**发现的变化才通知 —— 你自己点刷新时变化就在眼前，不用再弹一遍。"
-                     + "刚启动的第一次拉取算基线，不会补报关机期间的变化。")
+                // 用 .init 显式转成 LocalizedStringKey，否则字符串拼接出来的是 String，
+                // SwiftUI 不会当 markdown 解析，界面上会露出 ** 星号
+                Text(.init("只有**自动刷新**发现的变化才通知 —— 你自己点刷新时变化就在眼前，不用再弹一遍。"
+                     + "刚启动的第一次拉取算基线，不会补报关机期间的变化。"))
                     .font(.caption).foregroundColor(.secondary)
             }
         } header: {

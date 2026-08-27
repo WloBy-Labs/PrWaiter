@@ -42,4 +42,33 @@ EOF
 swiftc -O -swift-version 5 -parse-as-library \
     -o "$APP/Contents/MacOS/PrWaiter" PrWaiter.swift
 
+# 有稳定签名身份就用它签，没有就退回 ad-hoc。
+#
+# 这不是可有可无的：**macOS 不给 ad-hoc 签名的 app 发通知权限** ——
+# requestAuthorization 直接返回 granted=false（UNErrorDomain error 1），
+# 而且系统设置的通知列表里根本不会出现这个 app。ad-hoc 签名每次构建都变，
+# 系统没法把授权记在一个稳定身份上。实测同一份代码：
+#   ad-hoc 签名        -> granted=false, alertStyle=0
+#   PrWaiter Signing   -> granted=true,  alertStyle=1（横幅）
+# 所以要调通知，得先跑一次 scripts/bootstrap_local_signing.sh。
+# bootstrap_local_signing.sh 默认把身份放进 login 钥匙串，名字是「PrWaiter Local Signing」；
+# CI 用的是「PrWaiter Signing」。两个都认，谁在就用谁。
+signed=""
+for name in "${CODESIGN_IDENTITY_NAME:-}" "PrWaiter Local Signing" "PrWaiter Signing"; do
+    [ -n "$name" ] || continue
+    if security find-identity 2>/dev/null | grep -q "$name"; then
+        if codesign --force --timestamp=none -s "$name" "$APP" >/dev/null 2>&1; then
+            echo "已用「${name}」签名（通知功能需要稳定身份）"
+            signed=1
+            break
+        fi
+    fi
+done
+
+if [ -z "$signed" ]; then
+    codesign --force -s - "$APP" >/dev/null 2>&1 || true
+    echo "提醒：ad-hoc 签名 —— 这样构建出来的包拿不到通知权限。"
+    echo "      要调通知先跑一次：scripts/bootstrap_local_signing.sh"
+fi
+
 echo "OK: $APP v$APP_VERSION"

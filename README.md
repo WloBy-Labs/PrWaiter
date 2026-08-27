@@ -51,6 +51,11 @@ brew install gh && gh auth login
 ./build.sh && open PrWaiter.app     # 开发时这样就够
 ```
 
+`build.sh` 会用本地的稳定签名身份签包（找不到就退回 ad-hoc 并提示）。**要调通知功能必须有稳定身份**
+—— macOS 不给 ad-hoc 签名的 app 发通知权限（`requestAuthorization` 直接返回
+`granted=false`，而且 app 不会出现在「系统设置 → 通知」列表里）。跑一次
+`scripts/bootstrap_local_signing.sh` 就有了。
+
 要出和 Release 一样的产物：
 
 ```bash
