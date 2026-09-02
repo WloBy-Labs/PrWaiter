@@ -589,6 +589,9 @@ struct LivePR {
     var url = ""
     var author = ""
     var base = ""       // 目标分支
+    /// 这条记录带了 check 明细没有。只拉基本字段时是 false ——
+    /// 合并进缓存时不能用它把上一轮真拉到的 CI 结论覆盖成空
+    var hasChecks = false
     var isDraft = false
     var review: String? // APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
     var ci: String?     // SUCCESS / FAILURE / ERROR / PENDING / EXPECTED
@@ -1232,11 +1235,19 @@ final class Model: ObservableObject {
     /// 拉取失败，按项目分开记 —— 所有项目并发刷新，别的项目挂了
     /// 不该显示在你正看着的这个项目头上
     @Published var errorByProject: [UUID: String] = [:]
+    /// 这一轮有几个 PR 没拉到（某条查询失败）。不算错误 —— 显示的是上一轮的值，
+    /// 但得说一声，否则看到的是旧状态却以为是最新的
+    @Published var partialByProject: [UUID: Int] = [:]
     var error: String? { store.selected.flatMap { errorByProject[$0] } }
+    var partial: Int? { store.selected.flatMap { partialByProject[$0] } }
     @Published var saveError: String?     // 落盘失败 —— 比拉取失败严重，改动是真丢
     @Published var loading = false
     /// 正在拉的项目。所有项目并发刷新时，单个 Bool 挡不住重入
     private var inFlight = Set<UUID>()
+    /// 已终结 PR 的轮转游标，每个项目一个 —— 每次刷新往后带几个，转完一圈从头来
+    private var settledCursor: [UUID: Int] = [:]
+    /// 正在单独刷新的 PR，按钮上转圈用
+    @Published var refreshingPRs = Set<Int>()
 
     /// 上一轮每个 PR 是什么状态，用来比对出变化。
     /// **只放内存**：重启之后第一次拉当基线，不补报关机期间的变化 ——
@@ -1653,6 +1664,16 @@ final class Model: ObservableObject {
         }
     }
 
+    /// 从 list 里按游标取 count 个，取完把游标往后挪（环形）。纯函数，方便单测。
+    nonisolated static func rotate<T>(_ list: [T], cursor: inout Int, count: Int) -> [T] {
+        guard !list.isEmpty, count > 0 else { return [] }
+        let n = min(count, list.count)
+        let start = ((cursor % list.count) + list.count) % list.count
+        let out = (0..<n).map { list[(start + $0) % list.count] }
+        cursor = start + n
+        return out
+    }
+
     /// 界面上只有一个「在忙」的指示：任何一件事在拉就转圈
     var busy: Bool { loading || inboxLoading }
 
@@ -1674,7 +1695,6 @@ final class Model: ObservableObject {
             loading = !inFlight.isEmpty
         }
 
-        // 状态和「我的 PR」搜索挤在同一次请求里 —— 慢的是握手不是数据量，见 fetchAll
         let numbers = p.nodes.allPRNumbers
         let who = Prefs.autoImportOn ? await account() : nil
         guard !numbers.isEmpty || !(who ?? "").isEmpty else {
@@ -1683,19 +1703,71 @@ final class Model: ObservableObject {
             errorByProject[pid] = nil
             return
         }
+        // 分档：还开着的每次都拉全字段；已终结的只顺带带几个、轮着来。
+        // 还没拉过的（缓存里没有）先只拉基本字段 —— 那时还不知道谁是 open，
+        // 一上来全拉全字段就又回到那条会 504 的大查询了。拿到 state 之后
+        // 下面会给「其实是 open 但还没 check 明细」的那几个补一次。
+        let cached = liveByProject[pid] ?? [:]
+        let full = numbers.filter { cached[$0]?.state == "OPEN" }
+        let settled = numbers.subtracting(full).sorted()
+        let slice = Self.rotate(settled, cursor: &settledCursor[pid, default: 0],
+                                count: Self.settledPerRefresh)
+        let unknown = numbers.filter { cached[$0] == nil }
+
         do {
-            let r = try await Self.fetchAll(repo: p.repo, numbers: numbers, account: who)
-            liveByProject[pid] = r.live
+            var r = try await Self.fetchAll(repo: p.repo, full: full,
+                                            basic: Set(slice).union(unknown), account: who)
+            // 刚发现是 open 却还没 check 明细的，补一次小查询（首次启动会走到这里）
+            let needChecks = Set(r.live.filter { $0.value.state == "OPEN" && !$0.value.hasChecks }.keys)
+                .subtracting(r.fullFetched)
+            if !needChecks.isEmpty,
+               let more = try? await Self.fetchAll(repo: p.repo, full: needChecks,
+                                                   basic: [], account: nil) {
+                for (n, v) in more.live { r.live[n] = v }
+                r = (r.live, r.found, r.fullFetched.union(more.fullFetched))
+            }
+
+            // 这一轮没拉到的保留上一轮的值。陈旧但真实的状态，比「拉取不到，
+            // 检查编号或仓库设置」有用得多 —— 后者看着像编号填错了，会把人带偏。
+            var live = cached
+            for (n, v) in r.live {
+                var v = v
+                // 只拉了基本字段的，别把上一轮真拉到的 CI 结论覆盖成空
+                if !v.hasChecks, let old = cached[n] {
+                    v.ci = old.ci
+                    v.hasChecks = old.hasChecks
+                }
+                live[n] = v
+            }
+            live = live.filter { numbers.contains($0.key) }   // 树上删掉的不留在缓存里
+            liveByProject[pid] = live
             fetchedAt[pid] = Date()
             errorByProject[pid] = nil
-            noticeChanges(in: pid, live: r.live, auto: auto)
-            fixBackportParents(in: pid, titles: r.live.mapValues(\.title))
+            // 这轮该拉却没拉到的（不含故意不拉的低优先级），说一声
+            let asked = full.union(Set(slice)).union(unknown)
+            let missed = asked.subtracting(r.live.keys)
+            partialByProject[pid] = missed.isEmpty ? nil : missed.count
+            noticeChanges(in: pid, live: live, auto: auto)
+            fixBackportParents(in: pid, titles: live.mapValues(\.title))
             // 导入放在后面：搜索结果跟状态是同一次请求带回来的，不用再跑一趟。
             // 新导进来的这一批要等下一拍才有状态 —— 换一次往返（5 秒）不值。
             if !r.found.isEmpty { importFound(r.found, into: pid) }
         } catch let e {
             errorByProject[pid] = e.localizedDescription
         }
+    }
+
+    /// 手动刷新一个 PR。已终结的 PR 平时只是轮着捎带，想立刻看它最新状态就点这个。
+    /// 拉全字段（含 check 明细），不管它是什么状态。
+    func refreshOne(_ pr: Int) async {
+        guard let p = project, !p.repo.isEmpty else { return }
+        let pid = p.id
+        guard !refreshingPRs.contains(pr) else { return }
+        refreshingPRs.insert(pr)
+        defer { refreshingPRs.remove(pr) }
+        guard let r = try? await Self.fetchAll(repo: p.repo, full: [pr], basic: [], account: nil),
+              let lv = r.live[pr] else { return }
+        liveByProject[pid]?[pr] = lv
     }
 
     /// 算出这个项目每个 PR 现在是什么状态。
@@ -2265,10 +2337,13 @@ final class Model: ObservableObject {
         }
     }
 
-    /// 一条查询里最多放几个 PR。每个 PR 要展开 100 条 check context + 50 个 suite，
-    /// 放多了 GitHub 网关会超时（实测 35 个一条要 12–17 秒、三次 504 一次）。
-    /// 拆成小块并发发，反而更快也更稳。
-    static let prPerQuery = 9
+    /// 只拉基本字段时，一条查询里放多少个 PR。基本字段便宜（实测 35 个挤一条
+    /// 6/6 成功、5.8 秒），分这么粗只是给 PR 特别多的人留点余量。
+    static let basicPerQuery = 25
+
+    /// 每次刷新顺带带几个已终结的 PR（轮着来）。已合并是终态、已关闭偶尔会被重开，
+    /// 所以不必每次都查，但也不能永远不查。
+    static let settledPerRefresh = 5
 
     /// 分支保护的必过项，按 repo@branch 缓存    /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，
     /// 每次刷新都去问一遍纯属浪费（一次请求要 3–5 秒）。缓存活到进程退出。
@@ -2290,16 +2365,28 @@ final class Model: ObservableObject {
         return got
     }
 
-    /// 一次 GraphQL 请求拉完所有东西：跟踪中那些 PR 的状态与 check 明细，
-    /// 外加「作者是我」「指派给我」两个搜索（自动导入要用）。
+    /// 拉 PR 状态。**按优先级分两档，这是整个取数的关键。**
     ///
-    /// 为什么要挤成一次：实测这台机器到 api.github.com，**TCP 只要 2ms，TLS 握手却要 1–5 秒**。
-    /// 而 gh 每调用一次就是一个新进程、一条新连接、一次新握手。所以成本几乎全在
-    /// **请求个数**上，跟数据量基本无关 —— 实测同一个查询，1 个别名 5.1 秒、20 个别名 6.6 秒；
-    /// 而多一次请求就要多 5 秒。把 4 次调用（两次 pr list + 两趟 GraphQL）合成 1 次，
-    /// 20 秒降到 9 秒。带上全部 CI 明细多花的 2 秒，比多一次往返的 5 秒划算得多。
-    nonisolated static func fetchAll(repo: String, numbers: Set<Int>, account: String?)
-        async throws -> (live: [Int: LivePR], found: [FoundPR])
+    /// 贵的是 check 明细：每个 PR 要展开 100 条 check context + 50 个 check suite。
+    /// 但**只有还开着的 PR 才用得上它** —— 已合并 / 已关闭的不算 CI（那一栏本来就不显示）。
+    /// 实测这台机器上跟踪着 86 个 PR，其中只有 4 个是 open 的：95% 的 check 明细
+    /// 拉回来直接丢掉，纯粹白花服务端开销，PR 攒多了就 504。
+    ///
+    /// 所以分两档：
+    /// - `full`  —— 还开着的，拉全字段（含 check 明细），每次刷新都拉
+    /// - `basic` —— 已终结的，只拉基本字段，而且每次只顺带带几个、轮着来
+    ///
+    /// 实测对比（同一个 35 个 PR 的项目）：
+    ///
+    ///     旧：一条大查询全字段     0/6 成功，平均 14.3 秒
+    ///     新：3 全字段 + 5 基本     8/8 成功，平均  3.9 秒
+    ///     新：三个项目并发一整轮    6/6 成功，平均  5.0 秒
+    ///
+    /// 返回的 fullFetched 是「这次真拉到 check 明细」的编号 —— 合并缓存时要用它，
+    /// 只拉了基本字段的那些不能把上一轮的 CI 结论覆盖成空。
+    nonisolated static func fetchAll(repo: String, full: Set<Int>, basic: Set<Int>,
+                                     account: String?)
+        async throws -> (live: [Int: LivePR], found: [FoundPR], fullFetched: Set<Int>)
     {
         guard let gh = ghPath() else {
             throw AppError("找不到 GitHub CLI（gh），到设置里可以一键安装")
@@ -2309,10 +2396,10 @@ final class Model: ObservableObject {
         }
         let parts = repo.split(separator: "/")
 
+        let basicFields = "number title state isDraft url reviewDecision baseRefName author { login }"
         // contexts 用 last 不用 first：一页最多 100 条，而重跑过几轮的 PR 能到 120+
         // （实测 StarRocks#77255 有 123 条）。要截也该截掉最老的那一批。
-        let fields = """
-        number title state isDraft url reviewDecision baseRefName author { login } \
+        let fullFields = basicFields + " " + """
         commits(last: 1) { nodes { commit { \
           statusCheckRollup { contexts(last: 100) { nodes { \
             __typename \
@@ -2321,45 +2408,41 @@ final class Model: ObservableObject {
           } } } \
           checkSuites(first: 50) { nodes { status conclusion } } } } }
         """
-        // 一次问太多 PR，GitHub 会 504。
-        //
-        // 1.0.2 把所有东西挤进一条请求，理由是「慢的是握手不是数据量」—— 那句话对延迟成立，
-        // 但没考虑**服务端**的开销：每个 PR 都要展开 100 条 context + 50 个 check suite，
-        // PR 一多就超过 GraphQL 网关的超时。实测跟踪 35 个 PR 时，单条查询要 12–17 秒，
-        // 三次里 504 一次。
-        //
-        // 拆成几条并发的小查询就没这问题：实测同样 35 个 PR 拆成 4 块并发，
-        // 4–9 秒、零失败。并发本来就几乎不要钱（4 条并发 1.4 秒 vs 串行 6.1 秒），
-        // 所以这里既更快又更稳。
-        let sorted = numbers.sorted()
-        var bodies: [String] = stride(from: 0, to: sorted.count, by: prPerQuery).map { start in
-            let chunk = sorted[start..<min(start + prPerQuery, sorted.count)]
-            let aliases = chunk
-                .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
-                .joined(separator: " ")
-            return " repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) }"
+
+        func alias(_ n: Int, _ fields: String) -> String {
+            "pr\(n): pullRequest(number: \(n)) { \(fields) }"
+        }
+        var groups: [[String]] = []
+        if !full.isEmpty { groups.append(full.sorted().map { alias($0, fullFields) }) }
+        let onlyBasic = basic.subtracting(full).sorted()
+        for start in stride(from: 0, to: onlyBasic.count, by: basicPerQuery) {
+            groups.append(onlyBasic[start..<min(start + basicPerQuery, onlyBasic.count)]
+                .map { alias($0, basicFields) })
+        }
+
+        var bodies = groups.map {
+            " repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \($0.joined(separator: " ")) }"
         }
         // 作者是我、或者指派给我，两者取并集 —— 机器人建的 backport 作者是 bot、
         // 只把你设成 assignee，光看 author 会漏掉。搜索条件是 AND，所以要两个。
-        // 搜索单独发一条：它跟按编号取 PR 是两种开销，混在一起只会让那一条更容易超时。
+        // 搜索单独发一条：它跟按编号取 PR 是两种开销。
         if let who = account, !who.isEmpty {
             let sel = "nodes { ... on PullRequest { number title state baseRefName } }"
             var search = ""
-            for (alias, term) in [("mine", "author"), ("assigned", "assignee")] {
-                search += " \(alias): search(query: \"repo:\(repo) is:pr \(term):\(who) sort:updated-desc\", "
+            for (a, term) in [("mine", "author"), ("assigned", "assignee")] {
+                search += " \(a): search(query: \"repo:\(repo) is:pr \(term):\(who) sort:updated-desc\", "
                     + "type: ISSUE, first: 100) { \(sel) }"
             }
             bodies.append(search)
         }
-        guard !bodies.isEmpty else { return ([:], []) }
+        guard !bodies.isEmpty else { return ([:], [], []) }
 
-        // 并发发出去，任何一条挂了就整体算失败 —— 半份数据比没有数据更误导人
-        var merged: [String: Any] = [:]
+        var data: [String: Any] = [:]
         var failure: Error?
         var firstError: String?
         await withTaskGroup(of: Result<[String: Any], Error>.self) { group in
             for body in bodies {
-                group.addTask { 
+                group.addTask {
                     do { return .success(try await graphql(gh, body)) }
                     catch { return .failure(error) }
                 }
@@ -2367,15 +2450,13 @@ final class Model: ObservableObject {
             for await r in group {
                 switch r {
                 case .success(let obj):
-                    let data = (obj["data"] as? [String: Any]) ?? [:]
-                    // repository 那一层每块都叫 repository，得把里面的别名摊平合并
-                    for (k, v) in data {
+                    for (k, v) in (obj["data"] as? [String: Any]) ?? [:] {
                         if k == "repository", let inner = v as? [String: Any] {
-                            var acc = (merged["repository"] as? [String: Any]) ?? [:]
+                            var acc = (data["repository"] as? [String: Any]) ?? [:]
                             acc.merge(inner) { a, _ in a }
-                            merged["repository"] = acc
+                            data["repository"] = acc
                         } else {
-                            merged[k] = v
+                            data[k] = v
                         }
                     }
                     if firstError == nil, let errs = obj["errors"] as? [[String: Any]] {
@@ -2386,11 +2467,9 @@ final class Model: ObservableObject {
                 }
             }
         }
-        if let failure, merged.isEmpty { throw failure }
-
-        let data = merged
 
         var live: [Int: LivePR] = [:]
+        var gotChecks = Set<Int>()
         var checks: [Int: (items: [CheckRollup.Item], suites: [CheckRollup.Suite])] = [:]
         let repoData = (data["repository"] as? [String: Any]) ?? [:]
         for case let v as [String: Any] in Array(repoData.values) {
@@ -2403,20 +2482,21 @@ final class Model: ObservableObject {
             lv.review = v["reviewDecision"] as? String
             lv.author = (v["author"] as? [String: Any])?["login"] as? String ?? ""
             lv.base = v["baseRefName"] as? String ?? ""
-            live[n] = lv
 
-            let commit = ((v["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
-                .first?["commit"] as? [String: Any]
-            let rollup = commit?["statusCheckRollup"] as? [String: Any]
-            let contexts = (rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
-            let suites = (commit?["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
-            checks[n] = (contexts.map(CheckRollup.Item.init(json:)),
-                         suites.map(CheckRollup.Suite.init(json:)))
+            if let commit = ((v["commits"] as? [String: Any])?["nodes"] as? [[String: Any]])?
+                .first?["commit"] as? [String: Any] {
+                lv.hasChecks = true
+                gotChecks.insert(n)
+                let rollup = commit["statusCheckRollup"] as? [String: Any]
+                let contexts = (rollup?["contexts"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+                let suites = (commit["checkSuites"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+                checks[n] = (contexts.map(CheckRollup.Item.init(json:)),
+                             suites.map(CheckRollup.Suite.init(json:)))
+            }
+            live[n] = lv
         }
-        // 个别编号不存在时 GraphQL 只报部分错误，能拿到的照常显示；全军覆没才抛错。
-        // 有块整个失败了（504 之类）也一样：一条都没拿到才报错，
-        // 拿到一部分就先显示一部分，别把已有数据抹成「未知」
-        if live.isEmpty, !numbers.isEmpty {
+        // 一条都没拿到才算失败；拿到一部分就先显示一部分（缺的那些由调用方保留旧值）
+        if live.isEmpty, !(full.isEmpty && basic.isEmpty) {
             if let msg = firstError { throw AppError(msg) }
             if let failure { throw failure }
         }
@@ -2430,12 +2510,12 @@ final class Model: ObservableObject {
             }
             for await (b, r) in group { required[b] = r }
         }
-        // CI 结论只给还开着的 PR 算 —— 已合并/已关闭的状态已经是终局，
-        // 那一栏只会挂着重跑前留下的假红，是噪音
+        // CI 结论只给还开着的 PR 算 —— 已合并 / 已关闭的状态已经是终局
         for (n, lv) in live where lv.state == "OPEN" {
             guard let c = checks[n] else { continue }
+            let base = live[n]?.base ?? ""
             live[n]?.ci = CheckRollup.state(contexts: c.items, suites: c.suites,
-                                            required: required[lv.base] ?? [])
+                                            required: required[base] ?? [])
         }
 
         var found: [Int: FoundPR] = [:]
@@ -2448,9 +2528,8 @@ final class Model: ObservableObject {
                                    isOpen: (d["state"] as? String) == "OPEN")
             }
         }
-        return (live, found.values.sorted { $0.number < $1.number })
+        return (live, found.values.sorted { $0.number < $1.number }, gotChecks)
     }
-
     /// 边跑边把输出一行行吐出来，装 gh 时用（brew 可能要跑好几分钟，不能干等）
     nonisolated static func runStreaming(
         _ path: String, _ args: [String],
@@ -2909,6 +2988,16 @@ struct ContentView: View {
                         .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.15)))
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.red.opacity(0.5)))
                         .padding(.bottom, 8)
+                    }
+                    if let n = m.partial, m.error == nil {
+                        Label("有 \(n) 个 PR 这次没拉到，显示的是上次的状态",
+                              systemImage: "clock.arrow.circlepath")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.12)))
+                            .padding(.bottom, 8)
                     }
                     if let e = m.error {
                         HStack {
@@ -3855,6 +3944,7 @@ struct NodeRow: View {
                     .foregroundColor(st == .merged ? .secondary : .primary)
                 Spacer()
                 collapsedBadge
+                if !m.editing { refreshButton }
                 // 徽标和状态词一起被导览指到 —— 那一步讲的是整片状态显示
                 HStack(spacing: 8) {
                     badges(lv)
@@ -3897,6 +3987,23 @@ struct NodeRow: View {
             .foregroundColor(.secondary)
             .help("拖动以重新归类")
             .modifier(TourTargetIf(on: tourSample && row.node.kind == .pr, target: .dragGrip))
+    }
+
+    /// 单独刷这一个 PR。已终结的 PR 平时是轮着捎带的（见 fetchAll 的分档），
+    /// 不想等轮到它就点这里。
+    @ViewBuilder
+    var refreshButton: some View {
+        let n = row.node.pr ?? 0
+        if m.refreshingPRs.contains(n) {
+            ProgressView().controlSize(.small)
+        } else {
+            Button { Task { await m.refreshOne(n) } } label: {
+                Image(systemName: "arrow.clockwise").font(.system(size: 10))
+            }
+            .buttonStyle(.borderless)
+            .foregroundColor(.secondary)
+            .help("只刷新这个 PR")
+        }
     }
 
     /// 目标分支。一组 backport 的标题一字不差，唯一的区别就是打到哪个分支上 ——
