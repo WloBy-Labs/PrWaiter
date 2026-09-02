@@ -24,6 +24,8 @@ struct Tests {
         importOrderTests()
         reparentTests()
         projectReorderTests()
+        partialFetchTests()
+        priorityFetchTests()
         watcherTests()
         inboxTests()
         checkRollupTests()
@@ -624,6 +626,91 @@ struct Tests {
 
         // 拉不到标题时不猜
         check(Tree.reparenting([trunk], titles: [:]) == nil, "没有标题就不动")
+    }
+
+    static func partialFetchTests() {
+        print("部分拉取失败时保留旧值:")
+
+        // 这一轮某块查询失败（504 / 连接被掐断），那几个 PR 不该被打成「未知」。
+        // 「拉取不到，检查编号或仓库设置」看起来像编号填错了，会把人往错方向带；
+        // 陈旧但真实的状态有用得多。
+        func lv(_ title: String, _ state: String) -> LivePR {
+            LivePR(title: title, state: state)
+        }
+        let tracked: Set<Int> = [1, 2, 3]
+        let previous: [Int: LivePR] = [1: lv("旧一", "OPEN"), 2: lv("旧二", "MERGED"), 3: lv("旧三", "OPEN")]
+        let fetched: [Int: LivePR] = [1: lv("新一", "OPEN")]        // 只回来一个
+
+        var live = previous
+        for (n, v) in fetched { live[n] = v }
+        live = live.filter { tracked.contains($0.key) }
+
+        check(live.count == 3, "三个都还在，没有变成未知")
+        check(live[1]?.title == "新一", "拿到的用新值")
+        check(live[2]?.title == "旧二" && live[3]?.title == "旧三", "没拿到的保留上一轮的值")
+        check(tracked.subtracting(fetched.keys).count == 2, "算得出这轮漏了几个，好提示用户")
+
+        // 从树上删掉的 PR 不该留在缓存里
+        let shrunk: Set<Int> = [1]
+        check(live.filter { shrunk.contains($0.key) }.count == 1, "树上删掉的不留在缓存里")
+
+        // 全都没拿到：这时候才该报错（fetchAll 里的判断）
+        let none: [Int: LivePR] = [:]
+        check(tracked.subtracting(none.keys).count == 3, "一个都没拿到时漏的就是全部")
+    }
+
+    static func priorityFetchTests() {
+        print("按优先级取数:")
+
+        // --- 轮转：每次往后带几个，转完一圈从头来 ---
+        // 已合并是终态、已关闭偶尔会被重开，所以不必每次都查，但也不能永远不查
+        let settled = [1, 2, 3, 4, 5, 6, 7]
+        var cur = 0
+        check(Model.rotate(settled, cursor: &cur, count: 3) == [1, 2, 3], "第一轮取前三个")
+        check(Model.rotate(settled, cursor: &cur, count: 3) == [4, 5, 6], "第二轮接着往后")
+        check(Model.rotate(settled, cursor: &cur, count: 3) == [7, 1, 2], "转到末尾就绕回开头")
+        var c2 = 0
+        check(Model.rotate([9], cursor: &c2, count: 3) == [9], "只有一个时不会重复给三份")
+        var c3 = 0
+        check(Model.rotate([Int](), cursor: &c3, count: 3).isEmpty, "空列表返回空")
+        var c4 = 0
+        check(Model.rotate(settled, cursor: &c4, count: 0).isEmpty, "要 0 个就给 0 个")
+        // 游标脏了也不能崩（比如项目里的 PR 被删了一半）
+        var big = 999
+        check(Model.rotate([1, 2, 3], cursor: &big, count: 2).count == 2, "游标超出范围时取模，不越界")
+
+        // --- 分档：谁进 full、谁进 basic ---
+        // 这是省下 95% 服务端开销的关键：贵的 check 明细只有 open 的 PR 用得上
+        let tracked: Set<Int> = [10, 11, 12, 13]
+        let cached: [Int: LivePR] = [
+            10: LivePR(title: "开着的", state: "OPEN"),
+            11: LivePR(title: "合了的", state: "MERGED"),
+            12: LivePR(title: "关了的", state: "CLOSED"),
+            // 13 还没拉过
+        ]
+        let full = tracked.filter { cached[$0]?.state == "OPEN" }
+        let unknown = tracked.filter { cached[$0] == nil }
+        check(full == [10], "只有 open 的进全字段档")
+        check(unknown == [13], "还没拉过的先只拉基本字段 —— 那时还不知道谁是 open")
+        check(tracked.subtracting(full).sorted() == [11, 12, 13], "其余都是低优先级")
+
+        // --- 只拉了基本字段时，不能把上一轮的 CI 结论覆盖成空 ---
+        var fresh = LivePR(title: "新标题", state: "OPEN")
+        fresh.hasChecks = false                      // 这轮只拉了基本字段
+        var old = LivePR(title: "旧标题", state: "OPEN")
+        old.ci = "SUCCESS"; old.hasChecks = true
+        var merged = fresh
+        if !merged.hasChecks {
+            merged.ci = old.ci
+            merged.hasChecks = old.hasChecks
+        }
+        check(merged.title == "新标题", "标题用新的")
+        check(merged.ci == "SUCCESS", "CI 结论保留上一轮的，不被覆盖成空")
+        check(merged.hasChecks, "标记也跟着保留")
+        // 真拉到 check 明细时就用新的
+        var withChecks = LivePR(title: "新", state: "OPEN")
+        withChecks.ci = "FAILURE"; withChecks.hasChecks = true
+        check(withChecks.ci == "FAILURE", "拉到明细时用新结论")
     }
 
     static func watcherTests() {
