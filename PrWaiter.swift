@@ -1950,19 +1950,41 @@ final class Model: ObservableObject {
             ("asg", "assignee:\(account)", .assigned),
             ("men", "mentions:\(account)", .mentioned),
         ]
-        var body = ""
+        // 一个仓库一条查询，并发发出去。挤在一条里的话，仓库一多同样会 504 ——
+        // 跟看板那边是同一个毛病（见 fetchAll 里的注释）。
+        var bodies: [String] = []
         for (i, repo) in valid.enumerated() {
             let parts = repo.split(separator: "/")
-            body += " perm\(i): repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { viewerPermission }"
+            var body = " perm\(i): repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { viewerPermission }"
             for (tag, term, kind) in kinds {
                 let fields = kind == .mentioned ? prFields + " " + talkFields : prFields
                 body += " \(tag)\(i): search(query: \"repo:\(repo) is:pr is:open -author:\(account) "
                     + "\(term) sort:updated-desc\", type: ISSUE, first: 30) "
                     + "{ nodes { ... on PullRequest { \(fields) } } }"
             }
+            bodies.append(body)
         }
-        let obj = try await graphql(gh, body)
-        let data = (obj["data"] as? [String: Any]) ?? [:]
+
+        var data: [String: Any] = [:]
+        var failure: Error?
+        await withTaskGroup(of: Result<[String: Any], Error>.self) { group in
+            for body in bodies {
+                group.addTask {
+                    do { return .success(try await graphql(gh, body)) }
+                    catch { return .failure(error) }
+                }
+            }
+            for await r in group {
+                switch r {
+                case .success(let obj):
+                    // 每个仓库的别名都带自己的序号，键不会撞，直接合并
+                    for (k, v) in (obj["data"] as? [String: Any]) ?? [:] { data[k] = v }
+                case .failure(let e): failure = failure ?? e
+                }
+            }
+        }
+        // 一个仓库都没拿到才算失败；拿到一部分就先显示一部分
+        if data.isEmpty, let failure { throw failure }
 
         var raw: [ReviewItem] = []
         var writable: [String] = []
@@ -2192,6 +2214,9 @@ final class Model: ObservableObject {
     /// 所有项目并发刷新之后更容易撞上 —— 一个项目挂了整块就空了，
     /// 而重试一次的代价只在真失败的时候才付。
     private nonisolated static func graphql(_ gh: String, _ body: String) async throws -> [String: Any] {
+        await NetLimit.shared.acquire()
+        defer { Task { await NetLimit.shared.release() } }
+
         var last: Error = AppError("gh 调用失败")
         for attempt in 0..<2 {
             do {
@@ -2208,6 +2233,42 @@ final class Model: ObservableObject {
         }
         throw last
     }
+
+    /// 同时最多几条网络请求在飞。
+    ///
+    /// 两头都会出事，得卡在中间：
+    /// - **一条请求装太多** —— 服务端展开不完，GraphQL 网关 504
+    ///   （实测 35 个 PR 挤一条：6 轮全超时，平均 14 秒）
+    /// - **同时开太多连接** —— 这条网络扛不住，gh 直接报
+    ///   `Post "https://api.github.com/graphql": EOF`（实测 7 条并发，2 条被掐断）
+    ///
+    /// 所以：每条请求放 9 个 PR（4 块左右），全局并发压到 4 条。
+    /// 刷新时 3 个项目 + 评审清单是一起发的，不设全局上限的话瞬间就十几条连接。
+    actor NetLimit {
+        static let shared = NetLimit()
+        private let max = 4
+        private var active = 0
+        private var waiting: [CheckedContinuation<Void, Never>] = []
+
+        func acquire() async {
+            if active < max { active += 1; return }
+            await withCheckedContinuation { waiting.append($0) }
+        }
+
+        func release() {
+            if let next = waiting.first {
+                waiting.removeFirst()
+                next.resume()          // 名额直接交棒，active 不变
+            } else {
+                active -= 1
+            }
+        }
+    }
+
+    /// 一条查询里最多放几个 PR。每个 PR 要展开 100 条 check context + 50 个 suite，
+    /// 放多了 GitHub 网关会超时（实测 35 个一条要 12–17 秒、三次 504 一次）。
+    /// 拆成小块并发发，反而更快也更稳。
+    static let prPerQuery = 9
 
     /// 分支保护的必过项，按 repo@branch 缓存    /// 分支保护的必过项，按 repo@branch 缓存 —— 这东西几乎不变，
     /// 每次刷新都去问一遍纯属浪费（一次请求要 3–5 秒）。缓存活到进程退出。
@@ -2260,26 +2321,74 @@ final class Model: ObservableObject {
           } } } \
           checkSuites(first: 50) { nodes { status conclusion } } } } }
         """
-        var body = ""
-        if !numbers.isEmpty {
-            let aliases = numbers.sorted()
+        // 一次问太多 PR，GitHub 会 504。
+        //
+        // 1.0.2 把所有东西挤进一条请求，理由是「慢的是握手不是数据量」—— 那句话对延迟成立，
+        // 但没考虑**服务端**的开销：每个 PR 都要展开 100 条 context + 50 个 check suite，
+        // PR 一多就超过 GraphQL 网关的超时。实测跟踪 35 个 PR 时，单条查询要 12–17 秒，
+        // 三次里 504 一次。
+        //
+        // 拆成几条并发的小查询就没这问题：实测同样 35 个 PR 拆成 4 块并发，
+        // 4–9 秒、零失败。并发本来就几乎不要钱（4 条并发 1.4 秒 vs 串行 6.1 秒），
+        // 所以这里既更快又更稳。
+        let sorted = numbers.sorted()
+        var bodies: [String] = stride(from: 0, to: sorted.count, by: prPerQuery).map { start in
+            let chunk = sorted[start..<min(start + prPerQuery, sorted.count)]
+            let aliases = chunk
                 .map { "pr\($0): pullRequest(number: \($0)) { \(fields) }" }
                 .joined(separator: " ")
-            body += " repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) }"
+            return " repository(owner: \"\(parts[0])\", name: \"\(parts[1])\") { \(aliases) }"
         }
         // 作者是我、或者指派给我，两者取并集 —— 机器人建的 backport 作者是 bot、
         // 只把你设成 assignee，光看 author 会漏掉。搜索条件是 AND，所以要两个。
+        // 搜索单独发一条：它跟按编号取 PR 是两种开销，混在一起只会让那一条更容易超时。
         if let who = account, !who.isEmpty {
             let sel = "nodes { ... on PullRequest { number title state baseRefName } }"
+            var search = ""
             for (alias, term) in [("mine", "author"), ("assigned", "assignee")] {
-                body += " \(alias): search(query: \"repo:\(repo) is:pr \(term):\(who) sort:updated-desc\", "
+                search += " \(alias): search(query: \"repo:\(repo) is:pr \(term):\(who) sort:updated-desc\", "
                     + "type: ISSUE, first: 100) { \(sel) }"
             }
+            bodies.append(search)
         }
-        guard !body.isEmpty else { return ([:], []) }
+        guard !bodies.isEmpty else { return ([:], []) }
 
-        let obj = try await graphql(gh, body)
-        let data = (obj["data"] as? [String: Any]) ?? [:]
+        // 并发发出去，任何一条挂了就整体算失败 —— 半份数据比没有数据更误导人
+        var merged: [String: Any] = [:]
+        var failure: Error?
+        var firstError: String?
+        await withTaskGroup(of: Result<[String: Any], Error>.self) { group in
+            for body in bodies {
+                group.addTask { 
+                    do { return .success(try await graphql(gh, body)) }
+                    catch { return .failure(error) }
+                }
+            }
+            for await r in group {
+                switch r {
+                case .success(let obj):
+                    let data = (obj["data"] as? [String: Any]) ?? [:]
+                    // repository 那一层每块都叫 repository，得把里面的别名摊平合并
+                    for (k, v) in data {
+                        if k == "repository", let inner = v as? [String: Any] {
+                            var acc = (merged["repository"] as? [String: Any]) ?? [:]
+                            acc.merge(inner) { a, _ in a }
+                            merged["repository"] = acc
+                        } else {
+                            merged[k] = v
+                        }
+                    }
+                    if firstError == nil, let errs = obj["errors"] as? [[String: Any]] {
+                        firstError = errs.first?["message"] as? String
+                    }
+                case .failure(let e):
+                    failure = failure ?? e
+                }
+            }
+        }
+        if let failure, merged.isEmpty { throw failure }
+
+        let data = merged
 
         var live: [Int: LivePR] = [:]
         var checks: [Int: (items: [CheckRollup.Item], suites: [CheckRollup.Suite])] = [:]
@@ -2304,10 +2413,12 @@ final class Model: ObservableObject {
             checks[n] = (contexts.map(CheckRollup.Item.init(json:)),
                          suites.map(CheckRollup.Suite.init(json:)))
         }
-        // 个别编号不存在时 GraphQL 只报部分错误，能拿到的照常显示；全军覆没才抛错
-        if live.isEmpty, !numbers.isEmpty, let errs = obj["errors"] as? [[String: Any]],
-           let msg = errs.first?["message"] as? String {
-            throw AppError(msg)
+        // 个别编号不存在时 GraphQL 只报部分错误，能拿到的照常显示；全军覆没才抛错。
+        // 有块整个失败了（504 之类）也一样：一条都没拿到才报错，
+        // 拿到一部分就先显示一部分，别把已有数据抹成「未知」
+        if live.isEmpty, !numbers.isEmpty {
+            if let msg = firstError { throw AppError(msg) }
+            if let failure { throw failure }
         }
 
         // 必过项清单按分支查，只管还开着的 PR。清单进程内缓存，同一个分支只查一次。
