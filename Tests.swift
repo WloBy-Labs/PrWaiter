@@ -16,6 +16,8 @@ struct Tests {
         moveTests()
         deleteTests()
         flattenTests()
+        boardFilterTests()
+        aiOrganizeTests()
         collapseTests()
         guideTests()
         reorderTests()
@@ -26,6 +28,7 @@ struct Tests {
         projectReorderTests()
         partialFetchTests()
         priorityFetchTests()
+        fetchBatchTests()
         watcherTests()
         inboxTests()
         checkRollupTests()
@@ -51,6 +54,90 @@ struct Tests {
         let c = Node(kind: .pr, pr: 3)
         b = a.children[0]
         return ([topic, c], topic.id, a.id, b.id, c.id)
+    }
+
+    static func fetchBatchTests() {
+        print("网络请求分批:")
+        let items = Array(1...20)
+        let batches = Model.batches(items, size: Model.fullPerQuery)
+        check(batches.map(\.count) == [9, 9, 2], "完整字段按上限分批")
+        check(batches.flatMap { $0 } == items, "分批不遗漏、不重复并保持顺序")
+        check(Model.batches([Int](), size: 9).isEmpty, "空列表不发请求")
+    }
+
+    static func aiOrganizeTests() {
+        print("AI 整理:")
+        var child = Node(kind: .pr, pr: 2); child.note = "手写备注"
+        var root = Node(kind: .pr, pr: 1); root.children = [child]
+        let topic = Node(kind: .topic, title: "已有专题")
+        let p = Project(name: "测试", repo: "owner/repo", nodes: [root, topic])
+        let candidates = AIOrganize.candidates(p)
+        let parent = AISuggestion(pr: 1, topic_id: topic.id.uuidString, note: "根备注", reason: "同一主题")
+        let nested = AISuggestion(pr: 2, topic_id: "", note: "AI 备注", reason: "保留位置")
+        do {
+            let result = try AIOrganize.applying([parent, nested], project: p, candidates: candidates, moves: [1], notes: [2])
+            check(result.nodes.find(topic.id)?.children.first?.id == root.id, "根级子树移动到已有专题")
+            check(result.nodes.find(root.id)?.children.first?.id == child.id, "保留 PR 依赖")
+            check(result.nodes.find(child.id)?.note == "手写备注\nAI 备注", "AI 备注追加且保留手写内容")
+            check(p.nodes.first?.id == root.id && p.nodes.find(child.id)?.note == "手写备注", "不修改原项目")
+            let unchanged = try AIOrganize.applying([parent, nested], project: p, candidates: candidates, moves: [], notes: [])
+            check(unchanged.nodes.first?.id == root.id && unchanged.nodes.find(child.id)?.note == "手写备注", "未勾选时不改变数据")
+        } catch { check(false, "合法建议应该被接受: \(error)") }
+        check(AIOrganize.selectableMoves([parent, nested], project: p) == [1], "批量选择位置只选可移动根 PR")
+        check(AIOrganize.selectableNotes([parent, nested]) == [1, 2], "批量选择备注覆盖有备注建议的 PR")
+        let blank = AISuggestion(pr: 1, topic_id: "", note: "  ", reason: "保持")
+        check(AIOrganize.selectableNotes([blank]).isEmpty, "批量选择不包含空备注")
+        let invalid = AISuggestion(pr: 2, topic_id: topic.id.uuidString, note: "", reason: "相关")
+        check((try? AIOrganize.validate([parent, invalid], project: p, candidates: candidates)) == nil, "拒绝移动子 PR")
+        check((try? AIOrganize.validate([parent, parent], project: p, candidates: candidates)) == nil, "拒绝重复建议")
+        check((try? AIOrganize.validate([parent], project: p, candidates: candidates)) == nil, "拒绝遗漏候选")
+        let fake = AISuggestion(pr: 1, topic_id: UUID().uuidString, note: "", reason: "相关")
+        check((try? AIOrganize.validate([fake, nested], project: p, candidates: candidates)) == nil, "拒绝不存在的专题")
+        let badNote = AISuggestion(pr: 1, topic_id: "", note: String(repeating: "x", count: 251), reason: "相关")
+        check((try? AIOrganize.validate([badNote, nested], project: p, candidates: candidates)) == nil, "拒绝过长备注")
+        let job = AIJob(projectID: p.id, number: 1)
+        let restored = try? JSONDecoder().decode(AIJob.self, from: JSONEncoder().encode(job))
+        check(restored?.projectID == p.id && restored?.number == 1, "增量任务可持久化和恢复")
+        let context: [[String: Any]] = [["number": 1, "title": "title", "body": "description", "is_root": true]]
+        let input = try? AIOrganize.input(project: p, context: context, candidateNumbers: [1])
+        check(input?.contains("已有专题") == true && input?.contains("description") == true, "上下文包含已有专题和 PR 内容")
+        check((try? AIOrganize.endpoint("https://api.openai.com/v1"))?.absoluteString == "https://api.openai.com/v1/chat/completions", "构造兼容接口地址")
+        check((try? AIOrganize.endpoint("https://example.com/v1?key=secret")) == nil, "拒绝带查询参数的地址")
+        check((try? AIOrganize.endpoint("http://127.0.0.1:1234/v1")) != nil, "支持本机 HTTP 兼容服务")
+        check((try? AIOrganize.endpoint("http://example.com/v1")) == nil, "拒绝远程明文 HTTP")
+        let response = #"{"choices":[{"finish_reason":"stop","message":{"content":"{\"suggestions\":[]}"}}]}"#
+        check((try? AIOrganize.parse(Data(response.utf8)))?.isEmpty == true, "解析完整建议响应")
+        check((try? AIOrganize.parse(Data("{}".utf8))) == nil, "拒绝不完整响应")
+        let modelData = #"{"data":[{"id":"model-b"},{"id":"model-a","context_length":8192,"reasoning_efforts":["low","high"]},{"id":"model-a"}]}"#
+        let models = try? AIOrganize.parseModels(Data(modelData.utf8))
+        check(models?.map(\.id) == ["model-a", "model-b"], "模型列表去重并排序")
+        check(models?.first?.contextLength == 8192 && models?.first?.reasoningEfforts == ["low", "high"], "只展示服务提供的能力信息")
+        check(models?.last?.contextLength == nil && models?.last?.reasoningEfforts == nil, "未返回的能力保持未知")
+        check((try? AIOrganize.parseModels(Data("{}".utf8))) == nil, "拒绝不兼容的模型列表")
+    }
+
+    static func boardFilterTests() {
+        print("看板筛选:")
+        var f = fixture()
+        f.nodes[0].collapsed = true
+        f.nodes[0].children[0].collapsed = true
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let original = try! encoder.encode(f.nodes)
+        let rows = Tree.flatten(f.nodes) { $0 == 1 }
+        func status(_ row: Row) -> PRStatus {
+            switch row.node.pr { case 1: return .merged; case 2: return .needsReview
+            case 3: return .unknown; default: return .unknown }
+        }
+        let active = BoardFilter.rows(rows, scope: .active, status: nil, classify: status)
+        check(active.map(\.id) == [f.topic, f.a, f.b, f.c], "筛选展示折叠的匹配项和上游，未知状态保留")
+        let review = BoardFilter.rows(rows, scope: .active, status: .needsReview, classify: status)
+        check(review.map(\.id) == [f.topic, f.a, f.b], "状态筛选只保留匹配 PR 及祖先")
+        let settled = BoardFilter.rows(rows, scope: .settled, status: nil, classify: status)
+        check(settled.map(\.id) == [f.topic, f.a], "已完成只显示已终结 PR 和上下文")
+        let all = BoardFilter.rows(rows, scope: .all, status: nil, classify: status)
+        check(all.map(\.id) == [f.topic, f.c], "全部视图遵循原有折叠")
+        check((try! encoder.encode(f.nodes)) == original, "筛选不修改分组、依赖或折叠状态")
     }
 
     static func moveTests() {
